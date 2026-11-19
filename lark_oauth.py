@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_DOMAIN = "https://open.larksuite.com"
-DEFAULT_SCOPES = ["docx:document:readonly", "wiki:node:read", "offline_access"]
+DEFAULT_SCOPES = ["docx:document:readonly", "wiki:node:read", "bitable:app:readonly", "offline_access"]
 DEFAULT_REDIRECT_PORT = 9527
 REFRESH_SLACK_SECONDS = 300
 DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
