@@ -1,5 +1,10 @@
 # Lark Document Button -> LLM Pipeline: Official Documentation Research & Prototyping Guide
 
+> **Status: superseded.** This was the early options analysis. The recommended Base Button + HTTP automation
+> (Option A) was not available in the target Lark tenant, so the built prototype uses a checkbox column and a link to
+> a small web service instead. See `README.md` for what exists and how to run it. This file is kept for its
+> reference notes on the Lark APIs.
+
 ## 1. Executive Summary
 
 **Goal:** Embed a button in a Lark document that sends a table row payload to an LLM for inference, then grade the LLM output before integrating it into a downstream application (whose ingestion spec is not yet defined).
