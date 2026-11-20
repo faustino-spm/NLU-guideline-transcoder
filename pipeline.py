@@ -5,7 +5,11 @@ CLI:
     python pipeline.py --run         # process the ticked rows (Gemini, or the stub with LLM=stub)
 
 Row lifecycle: ticked -> Queued (box unticked, so a second run cannot pick it up)
--> Integrated, or Failed on any error. A failed row does not stop the others.
+-> Integrated with the CSV attached in the "Output CSV for NLU" column, or Failed on any error.
+A failed row does not stop the others.
+
+All state lives in the grid, and nothing is kept on the machine that runs this, so it also works
+on a host where each request may run on a different instance.
 """
 
 from __future__ import annotations
@@ -15,15 +19,16 @@ import logging
 import re
 import sys
 import tempfile
-import threading
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 from lark_base import (
     FIELD_ATTACHMENT,
     FIELD_DATE,
+    FIELD_OUTPUT,
     FIELD_PROCESS,
     FIELD_STATUS,
     FIELD_SUBCAMPAIGN,
@@ -43,7 +48,6 @@ STATUS_QUEUED = "Queued"
 STATUS_INTEGRATED = "Integrated"
 STATUS_FAILED = "Failed"
 
-DEFAULT_OUTPUT_DIR = Path("output")
 
 @dataclass(frozen=True)
 class Attachment:
@@ -59,6 +63,7 @@ class Row:
     date: date | None
     sub_campaign: str
     attachments: tuple[Attachment, ...]
+    outputs: tuple[Attachment, ...]
     process: bool
     status: str
 
@@ -86,22 +91,22 @@ def parse_row(record: dict[str, Any]) -> Row:
         date=ms_to_date(raw_date) if isinstance(raw_date, (int, float)) else None,
         sub_campaign=field_text(fields.get(FIELD_SUBCAMPAIGN)),
         attachments=parse_attachments(fields.get(FIELD_ATTACHMENT)),
+        outputs=parse_attachments(fields.get(FIELD_OUTPUT)),
         process=fields.get(FIELD_PROCESS) is True,
         status=field_text(fields.get(FIELD_STATUS)),
     )
 
 
+def all_rows(client: BaseClient) -> list[Row]:
+    return [parse_row(record) for record in client.list_records()]
+
+
 def ticked_rows(client: BaseClient) -> list[Row]:
     """Rows whose "Process Row?" box is ticked. Filtered here, not through the API."""
-    rows = (parse_row(record) for record in client.list_records())
-    return [row for row in rows if row.process]
+    return [row for row in all_rows(client) if row.process]
 
 
 # -- processing --------------------------------------------------------------
-
-
-class AlreadyRunning(RuntimeError):
-    """A run is in progress; only one may run at a time."""
 
 
 @dataclass
@@ -109,7 +114,7 @@ class RowResult:
     record_id: str
     status: str  # STATUS_INTEGRATED or STATUS_FAILED
     detail: str = ""
-    output_path: str | None = None
+    file_name: str | None = None  # the CSV attached to the row
 
 
 def _now() -> str:
@@ -121,16 +126,17 @@ class RunReport:
     started_at: str = field(default_factory=_now)
     finished_at: str | None = None
     results: list[RowResult] = field(default_factory=list)
-    error: str | None = None  # set when the whole run failed, e.g. the grid could not be read
-
-
-RUN_LOCK = threading.Lock()
+    remaining: int = 0  # rows still ticked at the end: not reached in time, or could not be claimed
 
 
 def safe_name(name: str) -> str:
     """A file name that is safe on Windows and cannot escape its folder (names are user-supplied)."""
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", Path(name.replace("\\", "/")).name).strip(" .")
     return cleaned or "file"
+
+
+def csv_file_name(row: Row) -> str:
+    return f"{row.date.isoformat() if row.date else 'no-date'}_{safe_name(row.record_id)}.csv"
 
 
 def download_attachments(client: BaseClient, row: Row, folder: Path) -> list[Path]:
@@ -140,14 +146,6 @@ def download_attachments(client: BaseClient, row: Row, folder: Path) -> list[Pat
         dest = folder / f"{index}_{safe_name(attachment.name)}"
         files.append(client.download_media(attachment.file_token, dest))
     return files
-
-
-def save_csv(output_dir: Path, row: Row, csv_text: str) -> Path:
-    """Write the row's CSV to output/<date>_<record_id>.csv, replacing a previous run's file."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / f"{row.date.isoformat() if row.date else 'no-date'}_{safe_name(row.record_id)}.csv"
-    path.write_text(csv_text, encoding="utf-8")
-    return path
 
 
 def _fail(client: BaseClient, row: Row, exc: Exception) -> RowResult:
@@ -160,7 +158,11 @@ def _fail(client: BaseClient, row: Row, exc: Exception) -> RowResult:
     return RowResult(row.record_id, STATUS_FAILED, detail)
 
 
-def _process_row(client: BaseClient, llm: LLM, row: Row, output_dir: Path) -> RowResult:
+def _process_row(client: BaseClient, llm: LLM, row: Row) -> RowResult:
+    """Download, run the LLM, attach the CSV and mark the row Integrated. Any error marks it Failed.
+
+    A re-run that fails leaves the row's previous CSV in place; the Status says Failed.
+    """
     try:
         if not row.attachments:
             raise ValueError("row has no attachment")
@@ -169,38 +171,50 @@ def _process_row(client: BaseClient, llm: LLM, row: Row, output_dir: Path) -> Ro
             csv_text = llm.generate_csv(row.date, row.sub_campaign, files)
         if not csv_text.strip():
             raise ValueError("the LLM returned an empty CSV")
-        path = save_csv(output_dir, row, csv_text)
-        client.update_record(row.record_id, {FIELD_STATUS: STATUS_INTEGRATED})
-        return RowResult(row.record_id, STATUS_INTEGRATED, f"{len(files)} file(s) read", str(path))
+        name = csv_file_name(row)
+        token = client.upload_media(name, csv_text.encode("utf-8"))
+        client.update_record(row.record_id, {FIELD_STATUS: STATUS_INTEGRATED,
+                                             FIELD_OUTPUT: [{"file_token": token}]})
+        return RowResult(row.record_id, STATUS_INTEGRATED, f"{len(files)} file(s) read", name)
     except Exception as exc:  # one bad row must not stop the others
         return _fail(client, row, exc)
 
 
-def process_ticked_rows(client: BaseClient, llm: LLM, report: RunReport | None = None,
-                        lock: threading.Lock = RUN_LOCK,
-                        output_dir: Path = DEFAULT_OUTPUT_DIR) -> RunReport:
-    """Claim every ticked row, then process them one by one.
+def run_ticked_rows(client: BaseClient, llm: LLM, budget_seconds: float | None = None,
+                    clock: Callable[[], float] = time.monotonic) -> Iterator[RowResult]:
+    """Process ticked rows one at a time, yielding each row's result as soon as it is done.
 
-    Each row's attachments are downloaded, passed to the LLM, and the returned CSV is saved
-    in `output_dir`. Pass a `report` to watch the results fill in while the run is in progress.
-    Raises AlreadyRunning if another run holds the lock.
+    The grid is read again before every row, so a row another run already claimed is not taken
+    twice and a newly ticked row is picked up. A row is claimed (Queued, box unticked) just before
+    it is processed. Once `budget_seconds` have passed no new row is started; rows not reached stay
+    ticked for the next run. A row already started is not interrupted, so keep the budget well
+    below the host's time limit.
     """
-    if not lock.acquire(blocking=False):
-        raise AlreadyRunning("A run is already in progress.")
+    deadline = None if budget_seconds is None else clock() + budget_seconds
+    seen: set[str] = set()
+    while deadline is None or clock() < deadline:
+        row = next((r for r in ticked_rows(client) if r.record_id not in seen), None)
+        if row is None:
+            return
+        seen.add(row.record_id)
+        try:
+            client.update_record(row.record_id, {FIELD_STATUS: STATUS_QUEUED, FIELD_PROCESS: False})
+        except Exception as exc:  # the row stays ticked and is picked up by the next run
+            yield RowResult(row.record_id, STATUS_FAILED, f"could not claim row: {exc}")
+            continue
+        yield _process_row(client, llm, row)
+
+
+def process_ticked_rows(client: BaseClient, llm: LLM, budget_seconds: float | None = None,
+                        report: RunReport | None = None) -> RunReport:
+    """Run `run_ticked_rows` to the end and collect the results. Pass a `report` to fill your own."""
     report = report if report is not None else RunReport()
     try:
-        queued: list[Row] = []
-        for row in ticked_rows(client):
-            try:
-                client.update_record(row.record_id, {FIELD_STATUS: STATUS_QUEUED, FIELD_PROCESS: False})
-                queued.append(row)
-            except Exception as exc:  # row stays ticked and is picked up by the next run
-                report.results.append(RowResult(row.record_id, STATUS_FAILED, f"could not claim row: {exc}"))
-        for row in queued:
-            report.results.append(_process_row(client, llm, row, output_dir))
+        for result in run_ticked_rows(client, llm, budget_seconds):
+            report.results.append(result)
+        report.remaining = len(ticked_rows(client))
     finally:
         report.finished_at = _now()
-        lock.release()
     return report
 
 
@@ -227,8 +241,10 @@ def cmd_run(client: BaseClient, llm: LLM) -> int:
     print(f"Processed {len(report.results)} row(s): "
           f"{len(report.results) - len(failed)} {STATUS_INTEGRATED}, {len(failed)} {STATUS_FAILED}.")
     for result in report.results:
-        where = f"  -> {result.output_path}" if result.output_path else ""
+        where = f"  -> {result.file_name}" if result.file_name else ""
         print(f"  {result.record_id}  {result.status}  {result.detail}{where}".rstrip())
+    if report.remaining:
+        print(f"{report.remaining} row(s) are still ticked.")
     return 1 if failed else 0
 
 
@@ -242,7 +258,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         client = client_from_env()
         return cmd_dry_run(client) if args.dry_run else cmd_run(client, llm_from_env())
-    except (ConfigError, LarkApiError, AlreadyRunning) as exc:
+    except (ConfigError, LarkApiError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

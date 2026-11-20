@@ -1,45 +1,51 @@
-import threading
 from datetime import date
 
 import pytest
 
 import pipeline
 from fakes import FakeClient, attachment, record
-from lark_base import FIELD_PROCESS, FIELD_STATUS
+from lark_base import FIELD_OUTPUT, FIELD_PROCESS, FIELD_STATUS
 from llm import StubLLM
 
 
-def run(client, llm, tmp_path, **kwargs):
-    """process_ticked_rows with a private lock and output folder, so tests never touch the repo."""
-    kwargs.setdefault("lock", threading.Lock())
-    return pipeline.process_ticked_rows(client, llm, output_dir=tmp_path / "output", **kwargs)
+def run(client, llm, **kwargs):
+    return pipeline.process_ticked_rows(client, llm, **kwargs)
 
 
 class RecordingLLM:
-    def __init__(self, fail_for_sub_campaign: str | None = None, csv_text: str = "a,b\n1,2\n"):
+    def __init__(self, fail_for_sub_campaign: str | None = None, csv_text: str = "a,b\n1,2\n", on_call=None):
         self.calls = []
         self.fail_for = fail_for_sub_campaign
         self.csv_text = csv_text
+        self.on_call = on_call
 
     def generate_csv(self, row_date, sub_campaign, files):
         # The files only exist during the call, so capture their contents now.
         self.calls.append((row_date, sub_campaign, [(f.name, f.read_bytes()) for f in files]))
+        if self.on_call:
+            self.on_call()
         if sub_campaign == self.fail_for:
             raise ValueError("model exploded")
         return self.csv_text
 
 
-# -- row model (Task 2) ------------------------------------------------------
+def status_of(client, record_id):
+    return client.records[record_id]["fields"][FIELD_STATUS]
+
+
+# -- row model ---------------------------------------------------------------
 
 
 def test_parse_row_reads_every_column():
-    row = pipeline.parse_row(record("r1", attachments=[attachment("tok1", "a.pdf", 10, "application/pdf")]))
+    row = pipeline.parse_row(record("r1", attachments=[attachment("tok1", "a.pdf", 10, "application/pdf")],
+                                    output=[attachment("out1", "old.csv", 5, "text/csv")]))
     assert row.record_id == "r1"
     assert row.date == date(2026, 3, 1)
     assert row.sub_campaign == "Class A"
     assert row.process is True
     assert row.status == "Not Processed"
     assert row.attachments == (pipeline.Attachment("tok1", "a.pdf", 10, "application/pdf"),)
+    assert row.outputs == (pipeline.Attachment("out1", "old.csv", 5, "text/csv"),)
 
 
 def test_parse_row_tolerates_empty_cells():
@@ -49,6 +55,7 @@ def test_parse_row_tolerates_empty_cells():
     assert row.sub_campaign == ""
     assert row.status == ""
     assert row.attachments == ()
+    assert row.outputs == ()
     assert row.process is False
 
 
@@ -76,162 +83,218 @@ def test_dry_run_prints_ticked_rows_and_writes_nothing(capsys):
     assert "r2" not in out
     assert client.updates == []
     assert client.downloads == []
+    assert client.uploads == {}
 
 
-# -- claim, process, finalize (Task 3) ---------------------------------------
+# -- claim, process, finalize ------------------------------------------------
 
 
-def test_claim_then_integrate_in_order_and_leave_unticked_rows_alone(tmp_path):
+def test_each_row_is_claimed_just_before_it_is_processed(tmp_path):
     client = FakeClient([record("r1"), record("r2", ticked=False), record("r3")])
-    report = run(client, RecordingLLM(), tmp_path)
+    report = run(client, RecordingLLM())
 
     claim = {FIELD_STATUS: "Queued", FIELD_PROCESS: False}
     done = {FIELD_STATUS: "Integrated"}
-    assert client.updates == [("r1", claim), ("r3", claim), ("r1", done), ("r3", done)]
+    assert [(rid, fields.get(FIELD_STATUS)) for rid, fields in client.updates] == [
+        ("r1", "Queued"), ("r1", "Integrated"), ("r3", "Queued"), ("r3", "Integrated")]
+    assert client.updates[0] == ("r1", claim)
+    assert {k: v for k, v in client.updates[1][1].items() if k != FIELD_OUTPUT} == done
     assert [(r.record_id, r.status) for r in report.results] == [("r1", "Integrated"), ("r3", "Integrated")]
     assert report.finished_at is not None
-    assert client.records["r2"]["fields"][FIELD_STATUS] == "Not Processed"
+    assert report.remaining == 0
+    assert status_of(client, "r2") == "Not Processed"
 
 
-def test_a_failing_row_is_marked_failed_and_the_others_still_run(tmp_path):
+def test_a_failing_row_is_marked_failed_and_the_others_still_run():
     client = FakeClient([record("r1", sub_campaign="bad"), record("r2", sub_campaign="good")])
-    report = run(client, RecordingLLM(fail_for_sub_campaign="bad"), tmp_path)
+    report = run(client, RecordingLLM(fail_for_sub_campaign="bad"))
 
     assert [(r.record_id, r.status) for r in report.results] == [("r1", "Failed"), ("r2", "Integrated")]
     assert "model exploded" in report.results[0].detail
-    assert client.records["r1"]["fields"][FIELD_STATUS] == "Failed"
+    assert status_of(client, "r1") == "Failed"
     assert client.records["r1"]["fields"][FIELD_PROCESS] is False
-    assert client.records["r2"]["fields"][FIELD_STATUS] == "Integrated"
+    assert FIELD_OUTPUT not in client.records["r1"]["fields"]
+    assert status_of(client, "r2") == "Integrated"
 
 
-def test_a_row_that_cannot_be_claimed_stays_ticked_and_is_skipped(tmp_path):
+def test_a_row_that_cannot_be_claimed_stays_ticked_and_is_not_retried_in_the_same_run():
     client = FakeClient([record("r1"), record("r2")], fail_updates_for={"r1"})
     llm = RecordingLLM()
-    report = run(client, llm, tmp_path)
+    report = run(client, llm)
 
     assert [(r.record_id, r.status) for r in report.results] == [("r1", "Failed"), ("r2", "Integrated")]
     assert "could not claim" in report.results[0].detail
     assert client.records["r1"]["fields"][FIELD_PROCESS] is True
+    assert report.remaining == 1
     assert len(llm.calls) == 1
 
 
-def test_processed_rows_are_not_picked_up_again(tmp_path):
+def test_processed_rows_are_not_picked_up_again():
     client = FakeClient([record("r1")])
-    run(client, RecordingLLM(), tmp_path)
-    assert run(client, RecordingLLM(), tmp_path).results == []
+    run(client, RecordingLLM())
+    assert run(client, RecordingLLM()).results == []
 
 
-def test_a_second_run_is_rejected_while_one_is_in_progress(tmp_path):
-    lock = threading.Lock()
-    client = FakeClient([record("r1")])
-    nested = {}
+def test_a_row_claimed_by_another_run_meanwhile_is_not_processed_twice():
+    client = FakeClient([record("r1"), record("r2")])
 
-    class ReentrantLLM:
-        def generate_csv(self, row_date, sub_campaign, files):
-            with pytest.raises(pipeline.AlreadyRunning):
-                run(client, StubLLM(), tmp_path, lock=lock)
-            nested["rejected"] = True
-            return "a\n1\n"
+    def another_run_claims_r2():
+        client.records["r2"]["fields"].update({FIELD_STATUS: "Queued", FIELD_PROCESS: False})
 
-    report = run(client, ReentrantLLM(), tmp_path, lock=lock)
-    assert nested == {"rejected": True}
-    assert report.results[0].status == "Integrated"
+    llm = RecordingLLM(on_call=another_run_claims_r2)
+    report = run(client, llm)
+    assert [r.record_id for r in report.results] == ["r1"]
+    assert len(llm.calls) == 1
 
 
-def test_lock_is_released_when_the_run_itself_fails(tmp_path):
-    lock = threading.Lock()
-
-    class BrokenClient(FakeClient):
-        def list_records(self, **_):
-            raise RuntimeError("network down")
-
-    with pytest.raises(RuntimeError):
-        run(BrokenClient([]), StubLLM(), tmp_path, lock=lock)
-    assert lock.acquire(blocking=False)
+def test_a_row_ticked_while_the_run_is_going_is_picked_up():
+    client = FakeClient([record("r1"), record("r2", ticked=False)])
+    llm = RecordingLLM(on_call=lambda: client.records["r2"]["fields"].update({FIELD_PROCESS: True}))
+    report = run(client, llm)
+    assert [r.record_id for r in report.results] == ["r1", "r2"]
 
 
-def test_a_passed_in_report_is_filled_in_place(tmp_path):
+def test_results_are_yielded_one_row_at_a_time():
+    client = FakeClient([record("r1"), record("r2")])
+    results = pipeline.run_ticked_rows(client, RecordingLLM())
+    assert next(results).record_id == "r1"
+    assert status_of(client, "r1") == "Integrated"
+    assert status_of(client, "r2") == "Not Processed"  # r2 is not even claimed yet
+    assert client.records["r2"]["fields"][FIELD_PROCESS] is True
+
+
+def test_no_new_row_starts_after_the_time_budget_and_the_rest_stay_ticked():
+    clock = [0.0]
+
+    def slow():
+        clock[0] += 100
+
+    client = FakeClient([record("r1"), record("r2"), record("r3")])
+    results = list(pipeline.run_ticked_rows(client, RecordingLLM(on_call=slow), budget_seconds=150,
+                                            clock=lambda: clock[0]))
+    assert [r.record_id for r in results] == ["r1", "r2"]  # r2 started at 100s, r3 would start at 200s
+    assert client.records["r3"]["fields"][FIELD_PROCESS] is True
+    assert status_of(client, "r3") == "Not Processed"
+
+
+def test_the_report_counts_rows_left_ticked_by_the_budget():
+    client = FakeClient([record("r1"), record("r2")])
+    report = run(client, RecordingLLM(), budget_seconds=0)
+    assert report.results == []
+    assert report.remaining == 2
+
+
+def test_a_passed_in_report_is_filled_in_place():
     report = pipeline.RunReport()
-    returned = run(FakeClient([record("r1")]), RecordingLLM(), tmp_path, report=report)
+    returned = run(FakeClient([record("r1")]), RecordingLLM(), report=report)
     assert returned is report
     assert len(report.results) == 1
 
 
-def test_cmd_run_prints_a_summary_and_returns_1_when_a_row_failed(capsys, tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)  # cmd_run saves into ./output
+def test_a_run_that_cannot_read_the_grid_still_sets_finished_at():
+    class BrokenClient(FakeClient):
+        def list_records(self, **_):
+            raise RuntimeError("network down")
+
+    report = pipeline.RunReport()
+    with pytest.raises(RuntimeError):
+        run(BrokenClient([]), StubLLM(), report=report)
+    assert report.finished_at is not None
+
+
+def test_cmd_run_prints_a_summary_and_returns_1_when_a_row_failed(capsys):
     client = FakeClient([record("r1", sub_campaign="bad"), record("r2")])
     code = pipeline.cmd_run(client, RecordingLLM(fail_for_sub_campaign="bad"))
     out = capsys.readouterr().out
     assert code == 1
     assert "Processed 2 row(s): 1 Integrated, 1 Failed." in out
-    assert str(date(2026, 3, 1)) in out
+    assert "-> 2026-03-01_r2.csv" in out
 
 
-# -- attachments and CSV output (Task 4) -------------------------------------
+# -- attachments and CSV output ----------------------------------------------
 
 
-def test_llm_receives_the_rows_inputs_and_downloaded_files(tmp_path):
+def test_llm_receives_the_rows_inputs_and_downloaded_files():
     client = FakeClient([record("r1", sub_campaign="Class B", attachments=[
         attachment("tokA", "one.pdf"), attachment("tokB", "two.docx")])])
     llm = RecordingLLM()
-    run(client, llm, tmp_path)
+    run(client, llm)
 
     assert client.downloads == ["tokA", "tokB"]
     assert llm.calls == [(date(2026, 3, 1), "Class B",
                           [("1_one.pdf", b"bytes of tokA"), ("2_two.docx", b"bytes of tokB")])]
 
 
-def test_csv_is_saved_as_date_and_record_id(tmp_path):
+def test_csv_is_uploaded_as_date_and_record_id_and_attached_to_the_row():
     client = FakeClient([record("rec123")])
-    report = run(client, RecordingLLM(csv_text="x,y\n1,2\n"), tmp_path)
+    report = run(client, RecordingLLM(csv_text="x,y\n1,2\n"))
 
-    expected = tmp_path / "output" / "2026-03-01_rec123.csv"
-    assert report.results[0].output_path == str(expected)
-    assert expected.read_text(encoding="utf-8") == "x,y\n1,2\n"
-
-
-def test_rerunning_a_row_overwrites_its_csv(tmp_path):
-    client = FakeClient([record("rec1")])
-    run(client, RecordingLLM(csv_text="v\n1\n"), tmp_path)
-    client.records["rec1"]["fields"][FIELD_PROCESS] = True
-    run(client, RecordingLLM(csv_text="v\n2\n"), tmp_path)
-    assert (tmp_path / "output" / "2026-03-01_rec1.csv").read_text(encoding="utf-8") == "v\n2\n"
+    assert client.uploads == {"up1": ("2026-03-01_rec123.csv", b"x,y\n1,2\n")}
+    assert report.results[0].file_name == "2026-03-01_rec123.csv"
+    assert client.records["rec123"]["fields"][FIELD_OUTPUT] == [{"file_token": "up1"}]
+    assert status_of(client, "rec123") == "Integrated"
 
 
-def test_row_without_attachment_fails_without_calling_the_llm(tmp_path):
+def test_csv_text_is_uploaded_as_utf8():
+    client = FakeClient([record("r1")])
+    run(client, RecordingLLM(csv_text="name\nJosé 李\n"))
+    assert client.uploads["up1"][1] == "name\nJosé 李\n".encode("utf-8")
+
+
+def test_a_row_without_a_date_gets_a_no_date_file_name():
+    client = FakeClient([record("r1", date_ms=None)])
+    assert run(client, RecordingLLM()).results[0].file_name == "no-date_r1.csv"
+
+
+def test_rerunning_a_row_replaces_its_csv():
+    client = FakeClient([record("rec1", output=[attachment("old", "old.csv", 9, "text/csv")])])
+    run(client, RecordingLLM(csv_text="v\n2\n"))
+    assert client.records["rec1"]["fields"][FIELD_OUTPUT] == [{"file_token": "up1"}]
+
+
+def test_row_without_attachment_fails_without_calling_the_llm_or_uploading():
     client = FakeClient([record("r1", attachments=None)])
     llm = RecordingLLM()
-    report = run(client, llm, tmp_path)
+    report = run(client, llm)
 
     assert report.results[0].status == "Failed"
     assert "no attachment" in report.results[0].detail
     assert llm.calls == []
-    assert client.records["r1"]["fields"][FIELD_STATUS] == "Failed"
-    assert not (tmp_path / "output").exists()
+    assert client.uploads == {}
+    assert status_of(client, "r1") == "Failed"
 
 
-def test_download_error_marks_the_row_failed_and_saves_nothing(tmp_path):
+def test_download_error_marks_the_row_failed_and_uploads_nothing_for_it():
     client = FakeClient([record("r1"), record("r2")], fail_downloads_for={"tok-r1"})
-    report = run(client, RecordingLLM(), tmp_path)
+    report = run(client, RecordingLLM())
 
     assert [(r.record_id, r.status) for r in report.results] == [("r1", "Failed"), ("r2", "Integrated")]
     assert "download refused" in report.results[0].detail
-    assert not (tmp_path / "output" / "2026-03-01_r1.csv").exists()
-    assert (tmp_path / "output" / "2026-03-01_r2.csv").exists()
+    assert [name for name, _ in client.uploads.values()] == ["2026-03-01_r2.csv"]
 
 
-def test_empty_csv_from_the_llm_fails_the_row(tmp_path):
+def test_upload_error_marks_the_row_failed_and_does_not_integrate_it():
+    client = FakeClient([record("r1")], fail_uploads=True)
+    report = run(client, RecordingLLM())
+
+    assert report.results[0].status == "Failed"
+    assert "upload refused" in report.results[0].detail
+    assert status_of(client, "r1") == "Failed"
+    assert FIELD_OUTPUT not in client.records["r1"]["fields"]
+
+
+def test_empty_csv_from_the_llm_fails_the_row():
     client = FakeClient([record("r1")])
-    report = run(client, RecordingLLM(csv_text="  \n"), tmp_path)
+    report = run(client, RecordingLLM(csv_text="  \n"))
     assert report.results[0].status == "Failed"
     assert "empty CSV" in report.results[0].detail
-    assert list((tmp_path).glob("output/*.csv")) == []
+    assert client.uploads == {}
 
 
-def test_stub_llm_output_is_a_valid_csv_describing_its_inputs(tmp_path):
+def test_stub_llm_output_is_a_valid_csv_describing_its_inputs():
     client = FakeClient([record("r1", attachments=[attachment("t", "guide.pdf")])])
-    report = run(client, StubLLM(), tmp_path)
-    text = open(report.results[0].output_path, encoding="utf-8").read()
+    run(client, StubLLM())
+    text = client.uploads["up1"][1].decode("utf-8")
     assert text.splitlines() == [
         "data_collection_date,sub_campaign,attachment_count,attachment_names",
         "2026-03-01,Class A,1,1_guide.pdf",
@@ -251,7 +314,7 @@ def test_safe_name_cannot_escape_the_folder(name, expected):
     assert pipeline.safe_name(name) == expected
 
 
-def test_downloaded_files_are_cleaned_up_after_each_row(tmp_path):
+def test_downloaded_files_are_cleaned_up_after_each_row():
     seen = []
 
     class SpyLLM:
@@ -259,5 +322,5 @@ def test_downloaded_files_are_cleaned_up_after_each_row(tmp_path):
             seen.extend(files)
             return "a\n1\n"
 
-    run(FakeClient([record("r1")]), SpyLLM(), tmp_path)
+    run(FakeClient([record("r1")]), SpyLLM())
     assert seen and not any(path.exists() for path in seen)

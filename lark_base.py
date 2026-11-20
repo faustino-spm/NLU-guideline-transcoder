@@ -43,11 +43,14 @@ FIELD_SUBCAMPAIGN = "Sub-campaign (Doc Class 6)"
 FIELD_ATTACHMENT = "QA Guidelines/PhoneMon (Bank)"
 FIELD_PROCESS = "Process Row?"
 FIELD_STATUS = "Status"
-EXPECTED_FIELDS = (FIELD_DATE, FIELD_SUBCAMPAIGN, FIELD_ATTACHMENT, FIELD_PROCESS, FIELD_STATUS)
+FIELD_OUTPUT = "Output CSV for NLU"
+EXPECTED_FIELDS = (FIELD_DATE, FIELD_SUBCAMPAIGN, FIELD_ATTACHMENT, FIELD_PROCESS, FIELD_STATUS, FIELD_OUTPUT)
 
 TOKEN_SLACK_SECONDS = 300
-# The media download API allows 5 requests per second; stay below that.
+# The media download and upload APIs each allow 5 requests per second; stay below that.
 DOWNLOAD_MIN_INTERVAL = 0.25
+# The simple upload call accepts files up to 20 MB.
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 # Lark error codes for a missing, invalid or expired access token.
 INVALID_TOKEN_CODES = {99991661, 99991663, 99991668}
 # Error codes that usually mean the app has no access to the Base.
@@ -137,7 +140,31 @@ class BaseClient:
         self.table_id = table_id
         self._domain = domain.rstrip("/")
         self._http = http or httpx.Client(timeout=30.0)
-        self._last_download = 0.0
+        self._last_media_call = 0.0
+        self._media_parent: str | None = None
+
+    def _upload_target(self) -> str:
+        """The token an upload must name as its parent.
+
+        A Base opened from a wiki is addressed by its wiki node token in the records API, but
+        uploads need the Base's own token, which the wiki node lookup returns. A token that is
+        not a wiki node (or a failed lookup) is used as given.
+        """
+        if self._media_parent is None:
+            self._media_parent = self.app_token
+            try:
+                node = self._call("GET", "/wiki/v2/spaces/get_node", params={"token": self.app_token}).get("node") or {}
+                if node.get("obj_type") == "bitable" and node.get("obj_token"):
+                    self._media_parent = str(node["obj_token"])
+            except (LarkApiError, httpx.HTTPError):
+                pass
+        return self._media_parent
+
+    def _throttle_media(self) -> None:
+        wait = self._last_media_call + DOWNLOAD_MIN_INTERVAL - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        self._last_media_call = time.monotonic()
 
     @property
     def _table_path(self) -> str:
@@ -193,15 +220,41 @@ class BaseClient:
         data = self._call("PUT", f"{self._table_path}/records/{record_id}", json={"fields": fields})
         return data.get("record") or {}
 
+    def upload_media(self, file_name: str, content: bytes) -> str:
+        """Upload a file into this Base and return its file token.
+
+        Put the token in an attachment column with `update_record(id, {column: [{"file_token": token}]})`.
+        Lark's simple upload takes files up to 20 MB and 5 requests per second.
+        """
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise ValueError(f"{file_name} is {len(content)} bytes; Lark's upload accepts at most 20 MB")
+        self._throttle_media()
+        parent = self._upload_target()
+        try:
+            data = self._call(
+                "POST", "/drive/v1/medias/upload_all",
+                data={"file_name": file_name, "parent_type": "bitable_file",
+                      "parent_node": parent, "size": str(len(content)),
+                      "extra": json.dumps({"drive_route_token": parent})},
+                files={"file": (file_name, content, "text/csv")},
+            )
+        except LarkApiError as exc:
+            if exc.code == 1061044:  # parent node not found
+                raise LarkApiError(exc.code, f"{exc.msg}. If the Base is opened from a wiki, the app may "
+                                   "lack access to read the wiki node that holds the Base's own token",
+                                   exc.http_status) from exc
+            raise
+        token = data.get("file_token")
+        if not token:
+            raise LarkApiError(None, "the upload returned no file_token")
+        return str(token)
+
     def download_media(self, file_token: str, dest: Path, extra: str | None = None) -> Path:
         """Download an attachment's bytes to `dest`. Throttled to stay under 5 requests per second.
 
         `extra` is only needed for Bases with advanced permissions (otherwise Lark answers 403).
         """
-        wait = self._last_download + DOWNLOAD_MIN_INTERVAL - time.monotonic()
-        if wait > 0:
-            time.sleep(wait)
-        self._last_download = time.monotonic()
+        self._throttle_media()
 
         url = f"{self._domain}/open-apis/drive/v1/medias/{file_token}/download"
         params = {"extra": extra} if extra else None

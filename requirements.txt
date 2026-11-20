@@ -1,4 +1,2 @@
-httpx
 fastapi
-uvicorn
-pytest
+httpx
