@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import date
 from types import SimpleNamespace
 
@@ -207,17 +208,31 @@ def test_client_from_env_defaults_to_the_tenant_token(monkeypatch):
     assert isinstance(client._tokens, TenantTokenProvider)
 
 
-def test_client_from_env_can_use_the_logged_in_users_token(monkeypatch):
-    _set_env(monkeypatch, LARK_AUTH="User")
-    client = lark_base.client_from_env()
-    assert isinstance(client._tokens, lark_base.UserTokenProvider)
+def test_client_from_env_accepts_an_explicit_tenant_setting(monkeypatch):
+    _set_env(monkeypatch, LARK_AUTH="Tenant")
+    assert isinstance(lark_base.client_from_env()._tokens, TenantTokenProvider)
 
 
-def test_client_from_env_rejects_an_unknown_auth_mode(monkeypatch):
-    _set_env(monkeypatch, LARK_AUTH="both")
+@pytest.mark.parametrize("mode", ["user", "both"])
+def test_client_from_env_rejects_other_auth_modes(monkeypatch, mode):
+    _set_env(monkeypatch, LARK_AUTH=mode)
     with pytest.raises(ConfigError) as exc:
         lark_base.client_from_env()
     assert "LARK_AUTH" in str(exc.value)
+
+
+def test_load_dotenv_sets_missing_values_and_keeps_existing_ones(tmp_path, monkeypatch):
+    env_file = tmp_path / ".env"
+    env_file.write_text('# comment\nNEW_ONE="quoted value"\nexport OTHER=plain\nKEPT=from-file\n', encoding="utf-8")
+    monkeypatch.delenv("NEW_ONE", raising=False)
+    monkeypatch.delenv("OTHER", raising=False)
+    monkeypatch.setenv("KEPT", "from-environment")
+    lark_base.load_dotenv(env_file)
+    assert os.environ["NEW_ONE"] == "quoted value"
+    assert os.environ["OTHER"] == "plain"
+    assert os.environ["KEPT"] == "from-environment"
+    monkeypatch.delenv("NEW_ONE")
+    monkeypatch.delenv("OTHER")
 
 
 # -- download_media ----------------------------------------------------------

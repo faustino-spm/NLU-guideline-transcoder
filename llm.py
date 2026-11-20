@@ -18,8 +18,7 @@ from typing import Callable, Protocol
 
 import httpx
 
-from lark_base import ConfigError
-from lark_oauth import load_dotenv
+from lark_base import ConfigError, load_dotenv
 
 log = logging.getLogger("llm")
 

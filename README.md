@@ -40,17 +40,13 @@ The names are constants at the top of `lark_base.py`.
 
 ## One-time Lark setup
 
-1. In the Lark developer console, enable the **`bitable:app`** scope for the app (tenant token scopes, and user token
-   scopes if you will use `LARK_AUTH=user`) and release a version. It also covers uploading the CSV; no other
-   scope was needed.
+1. In the Lark developer console, enable the **`bitable:app`** scope for the app (tenant token scopes) and release a
+   version. It also covers uploading the CSV; no other scope was needed.
 2. Add the app to the Base itself. This is separate from the scope: the scope lets the app call the API, and this
    step lets it touch this one Base. Open the Base in a browser, click `…` at the top right, then
    **More → Add Document App**, search for the app and give it edit rights. If the Base has advanced permissions
    turned on, give it manage rights. The app only shows up in the search once it has a Base or docs scope enabled.
    Without this step every call fails with `403 / 91403 Forbidden`, even with the scope released.
-   If you cannot do this yet, set `LARK_AUTH=user` in `.env` and run `python lark_oauth.py login`.
-   The backend then acts as the person who logged in. Use this for a local single-person demo only: the login is
-   saved in a file in your home folder and refresh tokens are single use, so do not use it on Vercel.
 3. Copy `.env.example` to `.env` and fill in `LARK_APP_ID`, `LARK_APP_SECRET`, `BASE_APP_TOKEN`, `TABLE_ID`, `RUN_KEY`,
    `GEMINI_API_KEY` (a free key from Google AI Studio). Generate the run key with
    `python -c "import secrets; print(secrets.token_urlsafe(24))"`. `GEMINI_MODEL` is optional.
@@ -93,7 +89,6 @@ Not yet deployed or tested on Vercel. The configuration follows Vercel's documen
    `.vercelignore`.
 2. In the project's Environment Variables, set `LARK_APP_ID`, `LARK_APP_SECRET`, `BASE_APP_TOKEN`, `TABLE_ID`,
    `RUN_KEY`, `GEMINI_API_KEY`. Optional: `GEMINI_MODEL`, `RUN_BUDGET_SECONDS`, `LARK_UTC_OFFSET_HOURS`.
-   Do not set `LARK_AUTH=user`.
 3. Use the production domain for the link in Lark: `https://<your-project>.vercel.app/run?key=<RUN_KEY>`. Check that
    it opens in a private window without a Vercel login. Vercel's Deployment Protection settings can put a login in
    front of a deployment.
@@ -198,8 +193,7 @@ python -m pytest
 | `web.py` | The link: confirmation page, streamed run, status page |
 | `pipeline.py` | Row model, `run_ticked_rows()` / `process_ticked_rows()`, and the command-line entry point |
 | `llm.py` | LLM interface, the stub, and the Gemini implementation (`GeminiLLM`, chosen by `llm_from_env()`) |
-| `lark_base.py` | Base client (tenant token, list/update records, attachment download and upload), settings, column names |
+| `lark_base.py` | Base client (tenant token, list/update records, attachment download and upload), settings, `.env` loading, column names |
 | `vercel.json`, `.vercelignore`, `.python-version`, `requirements.txt` | Vercel deployment settings. `requirements-dev.txt` adds `uvicorn` and `pytest` for local work |
-| `lark_oauth.py`, `lark_doc_client.py` | Earlier user-token login and Docx prototype. `lark_oauth.py` provides `load_dotenv` and the user-token fallback; its default scope list now has `bitable:app`. `lark_doc_client.py` is unchanged and not part of the deployment |
-| `lark-prototype-research.md` | Earlier design research. Its recommended Base Button option was not available in this tenant, so it is superseded by this README |
+| `lark-prototype-research.md` | Earlier design research. It mentions `lark_doc_client.py` and `lark_oauth.py` (the early user-token prototype), which have been removed. Its recommended Base Button option was not available in this tenant, so it is superseded by this README |
 | `prompt.txt` | The custom prompt sent to Gemini with each row's files |

@@ -7,13 +7,10 @@ Configuration (environment variables, or a `.env` file in the working directory)
     TABLE_ID                       required, the table to process (tbl...)
     LARK_UTC_OFFSET_HOURS          optional, default 8. Date fields are timestamps at local
                                    midnight; this is the offset used to turn them into dates.
-    LARK_AUTH                      optional, `tenant` (default, the app acts as itself) or `user`
-                                   (acts as whoever ran `python lark_oauth.py login`)
 
 Prerequisites in the Lark developer console and the Base:
-    * the app has the `bitable:app` scope (tenant token scopes, and user token scopes for
-      LARK_AUTH=user) and a released version
-    * tenant mode: the app was added to the Base as a document app with edit rights.
+    * the app has the `bitable:app` scope (tenant token scopes) and a released version
+    * the app was added to the Base as a document app with edit rights.
       Scopes decide which APIs the app may call; this decides which Bases it may touch.
 
 CLI:
@@ -35,7 +32,23 @@ from typing import Any
 
 import httpx
 
-from lark_oauth import DEFAULT_DOMAIN, LarkOAuth, UserTokenProvider, load_dotenv
+DEFAULT_DOMAIN = "https://open.larksuite.com"
+
+def load_dotenv(path: str | os.PathLike[str] = ".env") -> None:
+    """Load KEY=VALUE lines into os.environ without overriding existing variables."""
+    file = Path(path)
+    if not file.is_file():
+        return
+    for raw in file.read_text(encoding="utf-8-sig").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip().removeprefix("export ").strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
 
 # Column names in the grid. Change them here if the grid is renamed.
 FIELD_DATE = "Data Collection Date"
@@ -345,17 +358,12 @@ class Settings:
 
 
 def client_from_env() -> BaseClient:
-    """LARK_AUTH=tenant (default): the app acts as itself. LARK_AUTH=user: acts as the logged-in user."""
+    """A client that acts as the app itself (tenant access token)."""
     settings = Settings.from_env()
     mode = os.environ.get("LARK_AUTH", "tenant").strip().lower()
-    tokens: Any
-    if mode == "tenant":
-        tokens = TenantTokenProvider(settings.app_id, settings.app_secret, settings.domain)
-    elif mode == "user":
-        # Uses the tokens saved by `python lark_oauth.py login`. Run only one process at a time.
-        tokens = UserTokenProvider(LarkOAuth(settings.app_id, settings.app_secret, settings.domain))
-    else:
-        raise ConfigError(f"LARK_AUTH must be 'tenant' or 'user', not {mode!r}.")
+    if mode != "tenant":  # user mode was removed; do not silently act as the app instead
+        raise ConfigError(f"LARK_AUTH={mode!r} is no longer supported. Remove it; the app acts as itself.")
+    tokens = TenantTokenProvider(settings.app_id, settings.app_secret, settings.domain)
     return BaseClient(tokens, settings.app_token, settings.table_id, settings.domain)
 
 

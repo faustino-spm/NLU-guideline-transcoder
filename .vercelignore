@@ -9,4 +9,3 @@ output
 pytest.ini
 requirements-dev.txt
 lark-prototype-research.md
-lark_doc_client.py

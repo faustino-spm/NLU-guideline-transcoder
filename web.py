@@ -30,8 +30,7 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-from lark_base import BaseClient, ConfigError, LarkApiError, client_from_env
-from lark_oauth import load_dotenv
+from lark_base import BaseClient, ConfigError, LarkApiError, client_from_env, load_dotenv
 from llm import LLM, llm_from_env
 from pipeline import (
     STATUS_FAILED,
