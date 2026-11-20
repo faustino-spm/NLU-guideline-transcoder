@@ -27,7 +27,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from lark_base import BaseClient, ConfigError, LarkApiError, client_from_env
 from lark_oauth import load_dotenv
-from llm import LLM, StubLLM
+from llm import LLM, llm_from_env
 from pipeline import (
     DEFAULT_OUTPUT_DIR,
     STATUS_FAILED,
@@ -172,4 +172,4 @@ def create_app(client: BaseClient, llm: LLM, run_key: str,
 
 def app_from_env() -> FastAPI:
     load_dotenv()
-    return create_app(client_from_env(), StubLLM(), os.environ.get("RUN_KEY", ""))
+    return create_app(client_from_env(), llm_from_env(), os.environ.get("RUN_KEY", ""))

@@ -2,7 +2,7 @@
 
 CLI:
     python pipeline.py --dry-run     # list the rows that would be processed, change nothing
-    python pipeline.py --run         # process the ticked rows (stub LLM in Phase 1)
+    python pipeline.py --run         # process the ticked rows (Gemini, or the stub with LLM=stub)
 
 Row lifecycle: ticked -> Queued (box unticked, so a second run cannot pick it up)
 -> Integrated, or Failed on any error. A failed row does not stop the others.
@@ -34,7 +34,7 @@ from lark_base import (
     field_text,
     ms_to_date,
 )
-from llm import LLM, StubLLM
+from llm import LLM, llm_from_env
 
 log = logging.getLogger("pipeline")
 
@@ -241,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
         client = client_from_env()
-        return cmd_dry_run(client) if args.dry_run else cmd_run(client, StubLLM())
+        return cmd_dry_run(client) if args.dry_run else cmd_run(client, llm_from_env())
     except (ConfigError, LarkApiError, AlreadyRunning) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
