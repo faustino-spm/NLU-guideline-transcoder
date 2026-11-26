@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import zipfile
 from datetime import date
 
 import httpx
@@ -96,25 +97,86 @@ def test_placeholders_in_the_prompt_are_replaced_with_the_rows_values(tmp_path):
     assert texts[1] == 'Parse. Add unknown and unknown. Keep {"json": "braces"}.'
 
 
+def make_docx(tmp_path, name="doc.docx", text="Guideline row", header="", image_bytes: bytes | None = None):
+    path = tmp_path / name
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr(
+            "word/document.xml",
+            f'<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            f"<w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>",
+        )
+        if header:
+            zf.writestr(
+                "word/header1.xml",
+                f'<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                f"<w:p><w:r><w:t>{header}</w:t></w:r></w:p></w:hdr>",
+            )
+        if image_bytes is not None:
+            zf.writestr("word/media/image1.png", image_bytes)
+    return path
+
+
+def make_xlsx(tmp_path, name="sheet.xlsx"):
+    path = tmp_path / name
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr(
+            "xl/sharedStrings.xml",
+            '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            "<si><t>Agent</t></si><si><t>Note</t></si><si><t>Date</t></si></sst>",
+        )
+        zf.writestr(
+            "xl/styles.xml",
+            '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="14"/></cellXfs></styleSheet>',
+        )
+        zf.writestr(
+            "xl/workbook.xml",
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<sheets><sheet name="Calibration" sheetId="1"/></sheets></workbook>',
+        )
+        zf.writestr(
+            "xl/worksheets/sheet1.xml",
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<sheetData>'
+            '<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c><c r="C1" t="s"><v>2</v></c></row>'
+            # Blank column B (sparse): C2 should stay in column 3, and s="1" formats Excel serial 46082 -> 2026-03-01
+            '<row r="2"><c r="A2" t="inlineStr"><is><t>Ann</t></is></c><c r="C2" s="1"><v>46082</v></c></row>'
+            "</sheetData></worksheet>",
+        )
+    return path
+
+
 def test_every_file_is_sent_in_order_by_type(tmp_path):
     client, fake, _ = make(tmp_path, (200, reply(GOOD)))
     txt = tmp_path / "0_note.txt"
     txt.write_text("hello", encoding="utf-8")
-    files = [txt, pdf(tmp_path, "1_a.xlsx"), pdf(tmp_path, "2_b.DOCX"), pdf(tmp_path, "3_c.png")]
+    files = [
+        txt,
+        make_xlsx(tmp_path, "1_a.xlsx"),
+        make_docx(tmp_path, "2_b.DOCX", header="QA v2", image_bytes=b"\x89PNGfake"),
+        pdf(tmp_path, "3_c.png"),
+        pdf(tmp_path, "4_d.pdf"),
+    ]
     client.generate_csv(None, "", files)
     parts = fake.bodies[0]["messages"][1]["content"]
     assert parts[0] == {"type": "text", "text": "Attachment (0_note.txt):\nhello"}
-    assert parts[1]["type"] == "file"
-    assert parts[1]["file"]["file_data"].startswith(
-        "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,"
-    )
-    assert parts[2]["type"] == "file"
-    assert parts[2]["file"]["file_data"].startswith(
-        "data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,"
-    )
-    assert parts[3]["type"] == "image_url"
-    assert parts[3]["image_url"]["url"].startswith("data:image/png;base64,")
-    assert parts[4] == {"type": "text", "text": "Parse it."}
+    assert parts[1] == {
+        "type": "text",
+        "text": "Attachment (1_a.xlsx):\n=== Sheet: Calibration ===\nAgent,Note,Date\nAnn,,2026-03-01",
+    }
+    assert parts[2] == {
+        "type": "text",
+        "text": "Attachment (2_b.DOCX):\n=== Header ===\nQA v2\n\nGuideline row",
+    }
+    assert parts[3] == {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/png;base64,{base64.b64encode(b'\x89PNGfake').decode()}"},
+    }
+    assert parts[4]["type"] == "image_url"
+    assert parts[4]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert parts[5]["type"] == "file"
+    assert parts[5]["file"]["file_data"].startswith("data:application/pdf;base64,")
+    assert parts[6] == {"type": "text", "text": "Parse it."}
 
 
 def test_unsupported_file_type_fails_before_any_request(tmp_path):

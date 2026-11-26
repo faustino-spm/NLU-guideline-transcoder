@@ -80,5 +80,6 @@ Where `<SUB_CAMPAIGN_SLUG>` is `{sub_campaign}` converted to `UPPER_SNAKE_CASE` 
 
 ## Output Format
 - Reply with valid RFC-4180 CSV ONLY: the exact 14-column header row followed by all `_RIGHT_PARTY_CONTACT` rows and then all `_PTP` rows.
-- Quote any field containing a comma, double-quote, or newline.
+- **ALWAYS enclose `Component`, `Checklist Name`, `Special Condition` (when non-empty), `Passing Component Remarks`, `Failing Component Remarks`, `Failing Intent Remarks`, and `Fail Recommendation` in double quotes (`"..."`)**, escaping any internal double quote as `""`, so commas inside remarks or conditions can never shift column counts.
+- Verify every single line has **exact column count = 14** before replying.
 - No markdown code fences, no preamble, no explanation.
