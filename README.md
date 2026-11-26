@@ -20,6 +20,8 @@ on a different instance.
    - the generated CSV (`<date>_<record_id>.csv`) appears directly on the page with a **Download**
      link and an expandable **Preview** / **Copy CSV** button
 4. A run starts no new row once `RUN_BUDGET_SECONDS` (default 150) have passed.
+5. The **Status of all rows** page (`/status`) retains the output table of processed rows and their
+   CSV download links for the lifetime of the server instance.
 
 ## The grid (read-only)
 

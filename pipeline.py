@@ -105,6 +105,8 @@ class RowResult:
     detail: str = ""
     file_name: str | None = None
     csv_text: str | None = None
+    date: date | None = None
+    sub_campaign: str = ""
 
 
 def _now() -> str:
@@ -149,11 +151,12 @@ def _process_row(client: BaseClient, llm: LLM, row: Row) -> RowResult:
         if not csv_text.strip():
             raise ValueError("the LLM returned an empty CSV")
         name = csv_file_name(row)
-        return RowResult(row.record_id, STATUS_DONE, f"{len(files)} file(s) read", name, csv_text)
+        return RowResult(row.record_id, STATUS_DONE, f"{len(files)} file(s) read", name, csv_text,
+                         row.date, row.sub_campaign)
     except Exception as exc:  # one bad row must not stop the others
         detail = f"{type(exc).__name__}: {exc}"
         log.warning("row %s failed: %s", row.record_id, detail)
-        return RowResult(row.record_id, STATUS_FAILED, detail)
+        return RowResult(row.record_id, STATUS_FAILED, detail, date=row.date, sub_campaign=row.sub_campaign)
 
 
 def run_ticked_rows(client: BaseClient, llm: LLM, budget_seconds: float | None = None,

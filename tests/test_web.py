@@ -53,7 +53,7 @@ def make(records, llm=None, run_key=KEY, client=None, **kwargs):
 # -- key check ---------------------------------------------------------------
 
 
-@pytest.mark.parametrize("method, path", [("get", "/run"), ("post", "/run")])
+@pytest.mark.parametrize("method, path", [("get", "/run"), ("post", "/run"), ("get", "/status")])
 @pytest.mark.parametrize("params", [{}, {"key": "wrong"}, {"key": ""}])
 def test_every_page_needs_the_key(method, path, params):
     site, client, llm = make([record("r1")])
@@ -67,11 +67,10 @@ def test_the_app_refuses_to_start_without_a_run_key():
         web.create_app(FakeClient([]), StubLLM(), "")
 
 
-def test_api_docs_and_status_are_not_exposed():
+def test_api_docs_are_not_exposed():
     site, *_ = make([])
     assert site.get("/docs").status_code == 404
     assert site.get("/openapi.json").status_code == 404
-    assert site.get("/status", params={"key": KEY}).status_code == 404
 
 
 # -- confirmation page -------------------------------------------------------
@@ -95,12 +94,14 @@ def test_get_run_with_nothing_ticked_has_no_run_button():
     assert "<button" not in text
 
 
-def test_the_key_is_url_encoded_in_the_form_action_and_back_link():
+def test_the_key_is_url_encoded_in_links_and_the_form_action():
     site, *_ = make([record("r1")], run_key="k&1 x")
     get_text = site.get("/run", params={"key": "k&1 x"}).text
     assert 'action="/run?key=k%261%20x"' in get_text
+    assert 'href="/status?key=k%261%20x"' in get_text
     post_text = site.post("/run", params={"key": "k&1 x"}).text
     assert 'href="/run?key=k%261%20x"' in post_text
+    assert 'href="/status?key=k%261%20x"' in post_text
 
 
 def test_row_data_is_html_escaped():
@@ -186,6 +187,26 @@ def test_a_second_run_in_the_same_process_is_refused_while_one_is_going():
     assert "Done: 1 succeeded, 0 failed." in first["text"]
     # once finished, a new run can start again
     assert "Done: 1 succeeded" in site.post("/run", params={"key": KEY}).text
+
+
+# -- status page -------------------------------------------------------------
+
+
+def test_status_with_nothing_processed():
+    site, *_ = make([record("r1")])
+    assert "No row has been processed yet." in site.get("/status", params={"key": KEY}).text
+
+
+def test_status_retains_processed_rows_and_csv_downloads():
+    site, *_ = make([record("r1", sub_campaign="<b>x</b>"), record("r2", attachments=None)],
+                    llm=CountingLLM("a,b\n1,2\n"))
+    site.post("/run", params={"key": KEY})
+    text = site.get("/status", params={"key": KEY}).text
+    assert "r1" in text and "2026-03-01" in text and "&lt;b&gt;x&lt;/b&gt;" in text
+    assert "<b>x</b>" not in text
+    assert "2026-03-01_r1.csv" in text
+    assert "data:text/csv;charset=utf-8," in text
+    assert "r2" in text and "Failed" in text and "no attachment" in text
 
 
 # -- configuration and entrypoint --------------------------------------------

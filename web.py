@@ -12,8 +12,9 @@ Pages (all need ?key=<RUN_KEY>):
                    previews and double clicks are harmless.
     POST /run      processes ticked rows inside this request and streams each row's result and
                    downloadable CSV as it finishes.
+    GET  /status   output table of rows processed in this server instance, with downloadable CSVs.
 
-Nothing is written back to Lark or kept in memory between requests.
+Nothing is written back to Lark.
 """
 
 from __future__ import annotations
@@ -70,7 +71,7 @@ def _status_cell(status: str) -> str:
     return f'<td class="{css}">{html.escape(status)}</td>'
 
 
-RESULTS_HEAD = "<table><tr><th>Row</th><th>Status</th><th>Detail</th><th>CSV output</th></tr>"
+RESULTS_HEAD = "<table><tr><th>Row</th><th>Status</th><th>Detail</th><th>CSV file</th></tr>"
 
 
 def _csv_cell(result: RowResult) -> str:
@@ -97,6 +98,17 @@ def _rows_table(rows: list[Row]) -> str:
     return f"<table><tr><th>Rows that will be processed</th></tr>{items}</table>"
 
 
+def _processed_table(results: list[RowResult]) -> str:
+    body = "".join(
+        f"<tr><td>{html.escape(result.record_id)}</td>"
+        f"<td>{html.escape(result.date.isoformat() if result.date else '')}</td>"
+        f"<td>{html.escape(result.sub_campaign)}</td>{_status_cell(result.status)}"
+        f"<td>{html.escape(result.detail)}</td>{_csv_cell(result)}</tr>"
+        for result in results)
+    return ("<table><tr><th>Row</th><th>Date</th><th>Sub-campaign</th><th>Status</th>"
+            f"<th>Detail</th><th>CSV file</th></tr>{body}</table>")
+
+
 def _grid_error(exc: Exception) -> HTMLResponse:
     return HTMLResponse(_page("Cannot read the grid", f"<p>{html.escape(str(exc))}</p>"), status_code=502)
 
@@ -109,17 +121,21 @@ def create_app(client: BaseClient, llm: LLM, run_key: str,
     app = FastAPI(title="Row processor", docs_url=None, redoc_url=None, openapi_url=None)
     # Stops two concurrent runs in the same process (e.g. a double click).
     busy = threading.Lock()
+    # Retains the latest output per record_id for the /status output table.
+    history_lock = threading.Lock()
+    history: dict[str, RowResult] = {}
 
     def check_key(key: str) -> None:
         if not secrets.compare_digest(key.encode(), run_key.encode()):
             raise HTTPException(status_code=403, detail="Invalid or missing key.")
 
-    def back_link(key: str) -> str:
-        return f'<p><a href="/run?key={quote(key)}">Back to Run page</a></p>'
+    def links(key: str) -> str:
+        return (f'<p><a href="/run?key={quote(key)}">Run page</a> · '
+                f'<a href="/status?key={quote(key)}">Status of all rows</a></p>')
 
     def stream_run(key: str) -> Iterator[str]:
         if not busy.acquire(blocking=False):
-            yield _page("Already running", "<p>A run is already in progress.</p>" + back_link(key))
+            yield _page("Already running", "<p>A run is already in progress.</p>" + links(key))
             return
         try:
             yield (_head("Processing ticked rows")
@@ -129,6 +145,9 @@ def create_app(client: BaseClient, llm: LLM, run_key: str,
             try:
                 for result in run_ticked_rows(client, llm, budget_seconds):
                     results.append(result)
+                    with history_lock:
+                        history.pop(result.record_id, None)
+                        history[result.record_id] = result
                     yield _result_row(result)
                 yield "</table>"
                 left = max(0, len(ticked_rows(client)) - len(results))
@@ -143,7 +162,7 @@ def create_app(client: BaseClient, llm: LLM, run_key: str,
                 yield "<p>No rows were ticked.</p>"
             if left:
                 yield (f"<p>{left} ticked row(s) were not reached before the time budget ended.</p>")
-            yield back_link(key) + FOOT
+            yield links(key) + FOOT
         finally:
             busy.release()
 
@@ -162,12 +181,23 @@ def create_app(client: BaseClient, llm: LLM, run_key: str,
                     + f'<form method="post" action="/run?key={quote(key)}" '
                     "onsubmit=\"var b=this.querySelector('button');b.disabled=true;b.textContent='Running...'\">"
                     f'<p><button type="submit">Run {len(rows)} row(s)</button></p></form>')
-        return HTMLResponse(_page("Process ticked rows", body))
+        return HTMLResponse(_page("Process ticked rows", body + links(key)))
 
     @app.post("/run", response_model=None)
     def start(key: str = "") -> StreamingResponse:
         check_key(key)
         return StreamingResponse(stream_run(key), media_type="text/html")
+
+    @app.get("/status", response_class=HTMLResponse)
+    def status(key: str = "") -> HTMLResponse:
+        check_key(key)
+        with history_lock:
+            rows = list(history.values())
+        if not rows:
+            body = "<p>No row has been processed yet.</p>"
+        else:
+            body = _processed_table(rows)
+        return HTMLResponse(_page("Processed rows", body + links(key)))
 
     return app
 
