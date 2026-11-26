@@ -56,7 +56,8 @@ def load_dotenv(path: str | os.PathLike[str] = ".env") -> None:
 FIELD_DATE = "Data Collection Date"
 FIELD_SUBCAMPAIGN = "Sub-campaign (Doc Class 6)"
 FIELD_ATTACHMENT = "QA Guidelines/PhoneMon (Bank)"
-EXPECTED_FIELDS = (FIELD_DATE, FIELD_SUBCAMPAIGN, FIELD_ATTACHMENT)
+FIELD_PROCESS = "Process Row?"
+EXPECTED_FIELDS = (FIELD_DATE, FIELD_SUBCAMPAIGN, FIELD_ATTACHMENT, FIELD_PROCESS)
 
 TOKEN_SLACK_SECONDS = 300
 # The media download API allows 5 requests per second; stay below that.
@@ -329,8 +330,9 @@ def cmd_list(client: BaseClient) -> int:
         for name in missing:
             print(f"  - {name}")
     records = client.list_records()
-    print(f"{len(records)} row(s):")
-    for record in records:
+    ticked = [r for r in records if (r.get("fields") or {}).get(FIELD_PROCESS) is True]
+    print(f"{len(records)} rows, {len(ticked)} with '{FIELD_PROCESS}' ticked.")
+    for record in ticked:
         print("  " + _describe_row(record))
     return 1 if missing else 0
 
@@ -338,7 +340,7 @@ def cmd_list(client: BaseClient) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Read-only Lark Base client.")
     parser.add_subparsers(dest="command", required=True).add_parser(
-        "list", help="show missing columns and all rows")
+        "list", help="show row count, missing columns and ticked rows")
     parser.parse_args(argv)
     try:
         return cmd_list(client_from_env())

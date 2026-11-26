@@ -8,6 +8,7 @@ from typing import Any
 from lark_base import (
     FIELD_ATTACHMENT,
     FIELD_DATE,
+    FIELD_PROCESS,
     FIELD_SUBCAMPAIGN,
 )
 
@@ -17,7 +18,7 @@ MARCH_1_MS = 1772294400000
 _DEFAULT = object()
 
 
-def record(record_id: str, *, sub_campaign: str | None = "Class A",
+def record(record_id: str, *, ticked: bool = True, sub_campaign: str | None = "Class A",
            date_ms: int | None = MARCH_1_MS, attachments: Any = _DEFAULT) -> dict[str, Any]:
     """A record shaped like the list-records response (empty fields are omitted).
 
@@ -32,6 +33,8 @@ def record(record_id: str, *, sub_campaign: str | None = "Class A",
         fields[FIELD_SUBCAMPAIGN] = sub_campaign
     if attachments is not None:
         fields[FIELD_ATTACHMENT] = attachments
+    if ticked:
+        fields[FIELD_PROCESS] = True
     return {"record_id": record_id, "fields": fields}
 
 

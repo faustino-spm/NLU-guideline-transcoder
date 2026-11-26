@@ -74,26 +74,24 @@ def test_api_docs_and_status_are_not_exposed():
     assert site.get("/status", params={"key": KEY}).status_code == 404
 
 
-# -- row selection page ------------------------------------------------------
+# -- confirmation page -------------------------------------------------------
 
 
-def test_get_run_lists_all_rows_with_checkboxes_and_changes_nothing():
-    site, client, llm = make([record("r1"), record("r2", sub_campaign="Class B")])
+def test_get_run_lists_ticked_rows_and_changes_nothing():
+    site, client, llm = make([record("r1"), record("r2", ticked=False), record("r3")])
     response = site.get("/run", params={"key": KEY})
 
     assert response.status_code == 200
-    assert 'name="record_id" value="r1"' in response.text
-    assert 'name="record_id" value="r2"' in response.text
-    assert "Class A" in response.text and "Class B" in response.text
-    assert "Run selected rows" in response.text
+    assert "r1" in response.text and "r3" in response.text and "r2" not in response.text
+    assert "Run 2 row(s)" in response.text
     assert 'method="post"' in response.text
-    assert client.downloads == [] and llm.calls == 0
+    assert client.downloads == [] and llm.calls == 0  # a link preview or double click starts nothing
 
 
-def test_get_run_with_empty_grid_has_no_run_button():
-    site, *_ = make([])
+def test_get_run_with_nothing_ticked_has_no_run_button():
+    site, *_ = make([record("r1", ticked=False)])
     text = site.get("/run", params={"key": KEY}).text
-    assert "No rows found in the grid" in text
+    assert "No rows are ticked" in text
     assert "<button" not in text
 
 
@@ -101,7 +99,7 @@ def test_the_key_is_url_encoded_in_the_form_action_and_back_link():
     site, *_ = make([record("r1")], run_key="k&1 x")
     get_text = site.get("/run", params={"key": "k&1 x"}).text
     assert 'action="/run?key=k%261%20x"' in get_text
-    post_text = site.post("/run", params={"key": "k&1 x"}, data={"record_id": "r1"}).text
+    post_text = site.post("/run", params={"key": "k&1 x"}).text
     assert 'href="/run?key=k%261%20x"' in post_text
 
 
@@ -122,17 +120,16 @@ def test_an_unreadable_grid_gives_502_with_the_reason():
 # -- running -----------------------------------------------------------------
 
 
-def test_post_run_processes_selected_rows_and_embeds_downloadable_csv():
-    site, client, llm = make([record("r1"), record("r2")], llm=CountingLLM("col1,col2\n<v>,2\n"))
-    response = site.post("/run", params={"key": KEY}, data={"record_id": ["r2"]})
+def test_post_run_processes_ticked_rows_and_embeds_downloadable_csv():
+    site, client, llm = make([record("r1"), record("r2", ticked=False)], llm=CountingLLM("col1,col2\n<v>,2\n"))
+    response = site.post("/run", params={"key": KEY})
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
     assert llm.calls == 1
-    assert client.downloads == ["tok-r2"]
-    assert "2026-03-01_r2.csv" in response.text
+    assert client.downloads == ["tok-r1"]
+    assert "2026-03-01_r1.csv" in response.text
     assert "data:text/csv;charset=utf-8," in response.text
-    # Check the embedded data URI decodes to the exact CSV text and the preview is HTML-escaped.
     uri = response.text.split('href="data:text/csv;charset=utf-8,', 1)[1].split('"', 1)[0]
     assert unquote(uri) == "col1,col2\n<v>,2\n"
     assert "&lt;v&gt;,2" in response.text
@@ -141,24 +138,23 @@ def test_post_run_processes_selected_rows_and_embeds_downloadable_csv():
     assert response.text.rstrip().endswith("</html>")
 
 
-def test_post_run_with_nothing_selected_says_so():
-    site, client, llm = make([record("r1")])
+def test_post_run_with_nothing_ticked_says_so():
+    site, client, llm = make([record("r1", ticked=False)])
     text = site.post("/run", params={"key": KEY}).text
-    assert "No rows were selected." in text
+    assert "No rows were ticked." in text
     assert client.downloads == [] and llm.calls == 0
 
 
 def test_rows_not_reached_before_the_budget_ends_are_reported():
     site, _, llm = make([record("r1"), record("r2")], budget_seconds=0)
-    text = site.post("/run", params={"key": KEY}, data={"record_id": ["r1", "r2"]}).text
+    text = site.post("/run", params={"key": KEY}).text
     assert llm.calls == 0
-    assert "2 selected row(s) were not reached" in text
-    assert "r1, r2" in text
+    assert "2 ticked row(s) were not reached" in text
 
 
 def test_a_failed_row_is_shown_with_its_reason_and_counted():
     site, _, _ = make([record("r1", attachments=None), record("r2")])
-    text = site.post("/run", params={"key": KEY}, data={"record_id": ["r1", "r2"]}).text
+    text = site.post("/run", params={"key": KEY}).text
     assert "no attachment" in text
     assert "Done: 1 succeeded, 1 failed." in text
 
@@ -166,9 +162,9 @@ def test_a_failed_row_is_shown_with_its_reason_and_counted():
 def test_a_run_that_cannot_read_the_grid_says_so_and_releases_the_lock():
     broken = DownClient([])
     site, *_ = make([], client=broken)
-    text = site.post("/run", params={"key": KEY}, data={"record_id": ["r1"]}).text
+    text = site.post("/run", params={"key": KEY}).text
     assert "Run failed" in text and "91403" in text
-    assert "already in progress" not in site.post("/run", params={"key": KEY}, data={"record_id": ["r1"]}).text
+    assert "already in progress" not in site.post("/run", params={"key": KEY}).text
 
 
 def test_a_second_run_in_the_same_process_is_refused_while_one_is_going():
@@ -176,13 +172,11 @@ def test_a_second_run_in_the_same_process_is_refused_while_one_is_going():
     site, _, _ = make([record("r1")], llm=llm)
     other = TestClient(site.app)
     first = {}
-    runner = threading.Thread(
-        target=lambda: first.update(text=site.post("/run", params={"key": KEY}, data={"record_id": "r1"}).text)
-    )
+    runner = threading.Thread(target=lambda: first.update(text=site.post("/run", params={"key": KEY}).text))
     runner.start()
     try:
         assert llm.started.wait(5)
-        second = other.post("/run", params={"key": KEY}, data={"record_id": "r1"}).text
+        second = other.post("/run", params={"key": KEY}).text
         assert "already in progress" in second
     finally:
         llm.release.set()
@@ -191,7 +185,7 @@ def test_a_second_run_in_the_same_process_is_refused_while_one_is_going():
     assert llm.calls == 1
     assert "Done: 1 succeeded, 0 failed." in first["text"]
     # once finished, a new run can start again
-    assert "Done: 1 succeeded" in site.post("/run", params={"key": KEY}, data={"record_id": "r1"}).text
+    assert "Done: 1 succeeded" in site.post("/run", params={"key": KEY}).text
 
 
 # -- configuration and entrypoint --------------------------------------------
@@ -209,7 +203,7 @@ def env(monkeypatch):
 
 def test_app_from_env_builds_a_working_app(env):
     site = TestClient(web.app_from_env())
-    assert "Run selected rows" in site.get("/run", params={"key": KEY}).text
+    assert "Run 1 row(s)" in site.get("/run", params={"key": KEY}).text
 
 
 def test_app_from_env_reads_the_budget(env):

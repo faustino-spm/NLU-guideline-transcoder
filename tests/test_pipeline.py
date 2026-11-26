@@ -8,7 +8,7 @@ from llm import StubLLM
 
 
 def run(client, llm, **kwargs):
-    return pipeline.process_rows(client, llm, **kwargs)
+    return pipeline.process_ticked_rows(client, llm, **kwargs)
 
 
 class RecordingLLM:
@@ -36,14 +36,16 @@ def test_parse_row_reads_input_columns():
     assert row.record_id == "r1"
     assert row.date == date(2026, 3, 1)
     assert row.sub_campaign == "Class A"
+    assert row.process is True
     assert row.attachments == (pipeline.Attachment("tok1", "a.pdf", 10, "application/pdf"),)
 
 
 def test_parse_row_tolerates_empty_cells():
-    row = pipeline.parse_row(record("r2", sub_campaign=None, date_ms=None, attachments=None))
+    row = pipeline.parse_row(record("r2", ticked=False, sub_campaign=None, date_ms=None, attachments=None))
     assert row.date is None
     assert row.sub_campaign == ""
     assert row.attachments == ()
+    assert row.process is False
 
 
 def test_parse_attachments_skips_items_without_a_file_token():
@@ -51,39 +53,38 @@ def test_parse_attachments_skips_items_without_a_file_token():
     assert [a.file_token for a in parsed] == ["ok"]
 
 
-def test_dry_run_prints_all_rows_and_downloads_nothing(capsys):
+def test_ticked_rows_returns_only_ticked_rows():
+    client = FakeClient([record("r1"), record("r2", ticked=False), record("r3")])
+    assert [r.record_id for r in pipeline.ticked_rows(client)] == ["r1", "r3"]
+
+
+def test_dry_run_prints_ticked_rows_and_downloads_nothing(capsys):
     client = FakeClient([
         record("r1", attachments=[attachment("tok1", "a.pdf", 10)]),
-        record("r2", attachments=None),
+        record("r2", ticked=False),
+        record("r3", attachments=None),
     ])
     assert pipeline.cmd_dry_run(client) == 0
     out = capsys.readouterr().out
-    assert "2 row(s) in the grid." in out
+    assert "2 row(s) would be processed." in out
     assert "r1" in out and "a.pdf (10 bytes)" in out
-    assert "r2" in out and "no attachment" in out
+    assert "r3" in out and "no attachment" in out
+    assert "r2" not in out
     assert client.downloads == []
 
 
-# -- selection, processing, budget -------------------------------------------
+# -- processing, budget ------------------------------------------------------
 
 
-def test_selected_rows_are_processed_in_selection_order_and_deduplicated():
-    client = FakeClient([record("r1"), record("r2"), record("r3")])
+def test_only_ticked_rows_are_processed():
+    client = FakeClient([record("r1"), record("r2", ticked=False), record("r3")])
     llm = RecordingLLM()
-    report = run(client, llm, record_ids=["r3", "r1", "r3"])
+    report = run(client, llm)
 
-    assert [(r.record_id, r.status) for r in report.results] == [("r3", "Done"), ("r1", "Done")]
+    assert [(r.record_id, r.status) for r in report.results] == [("r1", "Done"), ("r3", "Done")]
     assert report.finished_at is not None
     assert report.remaining == 0
     assert len(llm.calls) == 2
-
-
-def test_unknown_record_id_fails_without_stopping_other_rows():
-    client = FakeClient([record("r1")])
-    report = run(client, RecordingLLM(), record_ids=["missing", "r1"])
-
-    assert [(r.record_id, r.status) for r in report.results] == [("missing", "Failed"), ("r1", "Done")]
-    assert "not found" in report.results[0].detail
 
 
 def test_a_failing_row_does_not_stop_the_others():
@@ -98,7 +99,7 @@ def test_a_failing_row_does_not_stop_the_others():
 
 def test_results_are_yielded_one_row_at_a_time():
     client = FakeClient([record("r1"), record("r2")])
-    results = pipeline.run_rows(client, RecordingLLM())
+    results = pipeline.run_ticked_rows(client, RecordingLLM())
     assert next(results).record_id == "r1"
     assert client.downloads == ["tok-r1"]
 
@@ -110,14 +111,14 @@ def test_no_new_row_starts_after_the_time_budget():
         clock[0] += 100
 
     client = FakeClient([record("r1"), record("r2"), record("r3")])
-    results = list(pipeline.run_rows(client, RecordingLLM(on_call=slow), budget_seconds=150,
-                                     clock=lambda: clock[0]))
+    results = list(pipeline.run_ticked_rows(client, RecordingLLM(on_call=slow), budget_seconds=150,
+                                            clock=lambda: clock[0]))
     assert [r.record_id for r in results] == ["r1", "r2"]  # r2 started at 100s, r3 would start at 200s
 
 
 def test_the_report_counts_rows_not_reached_by_the_budget():
     client = FakeClient([record("r1"), record("r2")])
-    report = run(client, RecordingLLM(), record_ids=["r1", "r2"], budget_seconds=0)
+    report = run(client, RecordingLLM(), budget_seconds=0)
     assert report.results == []
     assert report.remaining == 2
 
@@ -150,13 +151,6 @@ def test_cmd_run_writes_csvs_to_output_dir_and_returns_1_when_a_row_failed(capsy
     saved = tmp_path / "2026-03-01_r2.csv"
     assert saved.read_text(encoding="utf-8") == "h\nv\n"
     assert str(saved) in out
-
-
-def test_cli_run_requires_row_or_all(capsys):
-    with pytest.raises(SystemExit) as exc:
-        pipeline.main(["--run"])
-    assert exc.value.code == 2
-    assert "--row" in capsys.readouterr().err
 
 
 # -- attachments and CSV output ----------------------------------------------

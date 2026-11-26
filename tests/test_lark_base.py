@@ -138,16 +138,19 @@ def test_non_json_response_is_an_api_error():
 
 
 def test_list_fields_and_missing_fields():
-    items = [{"field_name": lark_base.FIELD_DATE}]
+    items = [{"field_name": name} for name in (lark_base.FIELD_DATE, lark_base.FIELD_PROCESS)]
     handler = lambda request: httpx.Response(200, json={"code": 0, "data": {"items": items, "has_more": False}})
     client = BaseClient(FakeTokens(), "APP", "TBL", http=http_client(handler))
     missing = lark_base.missing_fields(client.list_fields())
     assert missing == [lark_base.FIELD_SUBCAMPAIGN, lark_base.FIELD_ATTACHMENT]
 
 
-def test_cmd_list_prints_all_rows_and_reports_missing_columns(capsys):
+def test_cmd_list_prints_ticked_rows_and_reports_missing_columns(capsys):
     fields = [{"field_name": name} for name in lark_base.EXPECTED_FIELDS]
-    records = [{"record_id": "r1", "fields": {lark_base.FIELD_SUBCAMPAIGN: "Class A"}}]
+    records = [
+        {"record_id": "r1", "fields": {lark_base.FIELD_SUBCAMPAIGN: "Class A", lark_base.FIELD_PROCESS: True}},
+        {"record_id": "r2", "fields": {lark_base.FIELD_SUBCAMPAIGN: "Class B"}},
+    ]
 
     def handler(request):
         if request.url.path.endswith("/fields"):
@@ -157,8 +160,9 @@ def test_cmd_list_prints_all_rows_and_reports_missing_columns(capsys):
     client = BaseClient(FakeTokens(), "APP", "TBL", http=http_client(handler))
     assert lark_base.cmd_list(client) == 0
     out = capsys.readouterr().out
-    assert "1 row(s):" in out
+    assert "2 rows, 1 with 'Process Row?' ticked." in out
     assert "r1" in out and "Class A" in out
+    assert "r2" not in out
 
 
 # -- helpers -----------------------------------------------------------------
