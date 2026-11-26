@@ -1,9 +1,9 @@
 # Lark Base row processor (prototype)
 
 Tick rows in a Lark Base grid, click a link in Lark, and the backend runs each ticked row through
-an LLM and streams downloadable CSVs directly in the browser. The LLM is Gemini
-(`gemini-4-hydrogen` by default), prompted with `prompt.txt`. Set `LLM=stub` to use a stub instead
-(a fixed CSV describing its inputs), which tests the Lark wiring without calling Gemini.
+an LLM and streams downloadable CSVs directly in the browser. The LLM is NanoGPT
+(hardcoded to Hydrogen High: `google/gemini-4-hydrogen` with `reasoning_effort="high"`), prompted with `prompt.txt`. Set `LLM=stub` to use a stub instead
+(a fixed CSV describing its inputs), which tests the Lark wiring without calling NanoGPT.
 
 Lark Base access is read-only: nothing is written back to Lark and nothing is kept on disk or in
 memory between requests, so it runs on serverless hosts such as Vercel where each request may land
@@ -46,8 +46,8 @@ Lark records are never modified by the app.
    rights). Without this step every call fails with `403 / 91403 Forbidden`, even with the scope
    released.
 3. Copy `.env.example` to `.env` and fill in `LARK_APP_ID`, `LARK_APP_SECRET`, `BASE_APP_TOKEN`,
-   `TABLE_ID`, `RUN_KEY`, `GEMINI_API_KEY` (a free key from Google AI Studio). Generate the run key
-   with `python -c "import secrets; print(secrets.token_urlsafe(24))"`. `GEMINI_MODEL` is optional.
+   `TABLE_ID`, `RUN_KEY`, `NANOGPT_API_KEY` (from NanoGPT). Generate the run key
+   with `python -c "import secrets; print(secrets.token_urlsafe(24))"`.
 4. Install dependencies: `pip install -r requirements-dev.txt`.
 
 Check the setup (prints the row count, any missing columns, and the ticked rows):
@@ -82,7 +82,7 @@ imported.
    and the `app` in it, and installs `requirements.txt`. `requirements-dev.txt`, `tests/` and `.env`
    are left out by `.vercelignore`.
 2. In the project's Environment Variables, set `LARK_APP_ID`, `LARK_APP_SECRET`, `BASE_APP_TOKEN`,
-   `TABLE_ID`, `RUN_KEY`, `GEMINI_API_KEY`. Optional: `GEMINI_MODEL`, `RUN_BUDGET_SECONDS`,
+   `TABLE_ID`, `RUN_KEY`, `NANOGPT_API_KEY`. Optional: `RUN_BUDGET_SECONDS`,
    `LARK_UTC_OFFSET_HOURS`.
 3. Use the production domain for the link in Lark: `https://<your-project>.vercel.app/run?key=<RUN_KEY>`.
    Check that it opens in a private window without a Vercel login. Vercel's Deployment Protection
@@ -90,7 +90,7 @@ imported.
 
 Time limit: `vercel.json` sets the function's `maxDuration` to 300 seconds, the maximum on the
 Hobby plan. `RUN_BUDGET_SECONDS` must stay well below it, because a row that has started is never cut
-short by the app. A row takes one Lark download and one Gemini call (waits up to 300 seconds, and a
+short by the app. A row takes one Lark download and one NanoGPT call (waits up to 300 seconds, and a
 second call if the first reply is not a valid CSV). On a plan with a longer limit, raise
 `maxDuration` in `vercel.json` and `RUN_BUDGET_SECONDS` together.
 
@@ -102,10 +102,10 @@ Edits to `prompt.txt` take effect after a redeploy, because the file is part of 
 | --- | --- |
 | `403 / 91403 Forbidden` from `python lark_base.py list`, or the link page says "Cannot read the grid" | The app has no read access to the Base. Do setup step 2. Adding the scope alone does not fix it. |
 | `python lark_base.py list` reports a missing column | Fix the column name constants at the top of `lark_base.py`. |
-| Row ends `Failed` with `Gemini returned 429` | Free-tier rate limit or daily quota. The call was already retried twice. Wait and run the row again, or set `GEMINI_MODEL` to another model your key can use. |
+| Row ends `Failed` with `NanoGPT returned 429` | Rate limit or quota exceeded. The call was already retried twice. Wait and run the row again. |
 | Row ends `Failed` with `no usable CSV` or `cut off` | The model's reply was not a CSV with a header and consistent columns, or it hit its output limit. Make `prompt.txt` more specific, or split the attachment. |
 | The run page says ticked rows "were not reached" | The time budget ran out before they were reached. Untick finished rows in Lark and run again, or raise `RUN_BUDGET_SECONDS`. |
-| Server exits at startup with `GEMINI_API_KEY is not set` | Add the key to `.env` or the Vercel environment, or set `LLM=stub` to run without Gemini. |
+| Server exits at startup with `NANOGPT_API_KEY is not set` | Add the key to `.env` or the Vercel environment, or set `LLM=stub` to run without NanoGPT. |
 | Server exits at startup with `RUN_KEY is required` | Set `RUN_KEY`. The link must never be open to everyone. |
 | `uvicorn` starts but never listens, with an asyncio "is not the running loop" error | Seen once on Python 3.14 on Windows. Start it again. |
 | Attachment download returns 403 | A Base with advanced permissions may require the `extra` parameter on download. |
@@ -116,8 +116,7 @@ Edits to `prompt.txt` take effect after a redeploy, because the file is part of 
   (or written to `output/` by the CLI) instead of being attached back to Lark, and `Process Row?`
   remains ticked after a run.
 - A run handles as many ticked rows as fit in its time budget.
-- Attachments are sent to Gemini on the free tier, which may use content to improve Google products.
-  Use only non-confidential files for the demo.
+- Attachments are sent to NanoGPT (`google/gemini-4-hydrogen`). Use only non-confidential files if required by your data policy.
 - A reply that is not a valid CSV (no data rows, or rows with a different column count than the
   header) is asked for once more; after the second try the row is `Failed`. A reply cut off at the
   output limit also fails the row.
@@ -141,8 +140,8 @@ python -m pytest
 | `app.py` | Entrypoint: builds the app from the environment. Used by `uvicorn app:app` and by Vercel |
 | `web.py` | The link: confirmation page for ticked rows, streamed run with inline CSV downloads |
 | `pipeline.py` | Row model, `run_ticked_rows()` / `process_ticked_rows()`, and the command-line entry point |
-| `llm.py` | LLM interface, the stub, and the Gemini implementation (`GeminiLLM`, chosen by `llm_from_env()`) |
+| `llm.py` | LLM interface, the stub, and the NanoGPT implementation (`NanoGPTLLM`, chosen by `llm_from_env()`) |
 | `lark_base.py` | Read-only Base client (tenant token, list records/fields, attachment download), settings, `.env` loading, column names |
 | `vercel.json`, `.vercelignore`, `.python-version`, `requirements.txt` | Vercel deployment settings. `requirements-dev.txt` adds `uvicorn` and `pytest` for local work |
 | `lark-prototype-research.md` | Earlier design research (superseded by this README) |
-| `prompt.txt` | The custom prompt sent to Gemini with each row's files |
+| `prompt.txt` | The custom prompt sent to NanoGPT with each row's files |

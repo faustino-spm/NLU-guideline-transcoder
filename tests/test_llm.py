@@ -1,4 +1,4 @@
-"""GeminiLLM against a mocked Gemini API (no network)."""
+"""NanoGPTLLM against a mocked NanoGPT API (no network)."""
 
 from __future__ import annotations
 
@@ -11,16 +11,19 @@ import pytest
 
 import llm
 from lark_base import ConfigError
-from llm import GeminiLLM, LLMError, clean_csv, validate_csv
+from llm import LLMError, NANOGPT_MODEL, NANOGPT_URL, NanoGPTLLM, clean_csv, validate_csv
 
 GOOD = "name,score\nAnn,5\nBob,7\n"
 
 
-def reply(text: str, finish: str = "STOP") -> dict:
-    return {"candidates": [{"content": {"parts": [{"text": text}]}, "finishReason": finish}]}
+def reply(text: str, finish: str = "stop", reasoning: str | None = None) -> dict:
+    message: dict = {"role": "assistant", "content": text}
+    if reasoning is not None:
+        message["reasoning"] = reasoning
+    return {"choices": [{"message": message, "finish_reason": finish}]}
 
 
-class FakeGemini:
+class FakeNanoGPT:
     """Plays back a list of (status, json) responses and records the requests."""
 
     def __init__(self, *responses):
@@ -40,11 +43,11 @@ class FakeGemini:
 def make(tmp_path, *responses, prompt="Parse it.", **kwargs):
     prompt_file = tmp_path / "prompt.txt"
     prompt_file.write_text(prompt, encoding="utf-8")
-    fake = FakeGemini(*responses)
+    fake = FakeNanoGPT(*responses)
     sleeps: list[float] = []
-    gemini = GeminiLLM("test-key", "gemini-4-hydrogen", prompt_file, transport=httpx.MockTransport(fake),
-                       sleep=sleeps.append, **kwargs)
-    return gemini, fake, sleeps
+    client = NanoGPTLLM("test-key", NANOGPT_MODEL, prompt_file, transport=httpx.MockTransport(fake),
+                        sleep=sleeps.append, **kwargs)
+    return client, fake, sleeps
 
 
 def pdf(tmp_path, name="a.pdf", data=b"%PDF-1.7 fake"):
@@ -57,66 +60,83 @@ def pdf(tmp_path, name="a.pdf", data=b"%PDF-1.7 fake"):
 
 
 def test_request_carries_key_model_files_and_prompt(tmp_path):
-    gemini, fake, _ = make(tmp_path, (200, reply(GOOD)), prompt="  Parse the attachment.  ")
+    client, fake, _ = make(tmp_path, (200, reply(GOOD)), prompt="  Parse the attachment.  ")
     file = pdf(tmp_path, data=b"hello")
 
-    result = gemini.generate_csv(date(2026, 3, 1), "Class A", [file])
+    result = client.generate_csv(date(2026, 3, 1), "Class A", [file])
 
     assert result == GOOD
     request = fake.requests[0]
-    assert str(request.url) == "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent"
-    assert request.headers["x-goog-api-key"] == "test-key"
+    assert str(request.url) == NANOGPT_URL
+    assert request.headers["authorization"] == "Bearer test-key"
     assert "test-key" not in str(request.url)
     body = fake.bodies[0]
-    parts = body["contents"][0]["parts"]
-    assert parts[0]["inline_data"] == {"mime_type": "application/pdf", "data": base64.b64encode(b"hello").decode()}
-    assert parts[-1] == {"text": "Parse the attachment."}  # the row's values are not added unasked
-    assert "CSV only" in body["system_instruction"]["parts"][0]["text"]
+    assert body["model"] == "google/gemini-4-hydrogen"
+    assert body["reasoning_effort"] == "high"
+    assert body["messages"][0]["role"] == "system"
+    assert "CSV only" in body["messages"][0]["content"]
+    parts = body["messages"][1]["content"]
+    assert parts[0] == {
+        "type": "file",
+        "file": {
+            "filename": "a.pdf",
+            "file_data": f"data:application/pdf;base64,{base64.b64encode(b'hello').decode()}",
+        },
+    }
+    assert parts[-1] == {"type": "text", "text": "Parse the attachment."}  # the row's values are not added unasked
 
 
 def test_placeholders_in_the_prompt_are_replaced_with_the_rows_values(tmp_path):
-    gemini, fake, _ = make(tmp_path, (200, reply(GOOD)), (200, reply(GOOD)),
+    client, fake, _ = make(tmp_path, (200, reply(GOOD)), (200, reply(GOOD)),
                            prompt='Parse. Add {date} and {sub_campaign}. Keep {"json": "braces"}.')
-    gemini.generate_csv(date(2026, 3, 1), "Class A", [pdf(tmp_path)])
-    gemini.generate_csv(None, "", [pdf(tmp_path)])
-    texts = [b["contents"][0]["parts"][-1]["text"] for b in fake.bodies]
+    client.generate_csv(date(2026, 3, 1), "Class A", [pdf(tmp_path)])
+    client.generate_csv(None, "", [pdf(tmp_path)])
+    texts = [b["messages"][1]["content"][-1]["text"] for b in fake.bodies]
     assert texts[0] == 'Parse. Add 2026-03-01 and Class A. Keep {"json": "braces"}.'
     assert texts[1] == 'Parse. Add unknown and unknown. Keep {"json": "braces"}.'
 
 
-def test_every_file_is_sent_in_order_with_its_mime_type(tmp_path):
-    gemini, fake, _ = make(tmp_path, (200, reply(GOOD)))
-    files = [pdf(tmp_path, "1_a.xlsx"), pdf(tmp_path, "2_b.DOCX"), pdf(tmp_path, "3_c.png")]
-    gemini.generate_csv(None, "", files)
-    parts = fake.bodies[0]["contents"][0]["parts"]
-    assert [p["inline_data"]["mime_type"] for p in parts[:3]] == [
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "image/png",
-    ]
-    assert parts[3] == {"text": "Parse it."}
+def test_every_file_is_sent_in_order_by_type(tmp_path):
+    client, fake, _ = make(tmp_path, (200, reply(GOOD)))
+    txt = tmp_path / "0_note.txt"
+    txt.write_text("hello", encoding="utf-8")
+    files = [txt, pdf(tmp_path, "1_a.xlsx"), pdf(tmp_path, "2_b.DOCX"), pdf(tmp_path, "3_c.png")]
+    client.generate_csv(None, "", files)
+    parts = fake.bodies[0]["messages"][1]["content"]
+    assert parts[0] == {"type": "text", "text": "Attachment (0_note.txt):\nhello"}
+    assert parts[1]["type"] == "file"
+    assert parts[1]["file"]["file_data"].startswith(
+        "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,"
+    )
+    assert parts[2]["type"] == "file"
+    assert parts[2]["file"]["file_data"].startswith(
+        "data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,"
+    )
+    assert parts[3]["type"] == "image_url"
+    assert parts[3]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert parts[4] == {"type": "text", "text": "Parse it."}
 
 
 def test_unsupported_file_type_fails_before_any_request(tmp_path):
-    gemini, fake, _ = make(tmp_path)
+    client, fake, _ = make(tmp_path)
     with pytest.raises(LLMError, match=r"unsupported attachment type: x\.exe"):
-        gemini.generate_csv(None, "", [pdf(tmp_path, "x.exe")])
+        client.generate_csv(None, "", [pdf(tmp_path, "x.exe")])
     assert fake.requests == []
 
 
 def test_prompt_file_is_reread_on_every_call(tmp_path):
-    gemini, fake, _ = make(tmp_path, (200, reply(GOOD)), (200, reply(GOOD)), prompt="first")
-    gemini.generate_csv(None, "", [pdf(tmp_path)])
-    gemini.prompt_file.write_text("second", encoding="utf-8")
-    gemini.generate_csv(None, "", [pdf(tmp_path)])
-    assert fake.bodies[0]["contents"][0]["parts"][-1]["text"].endswith("first")
-    assert fake.bodies[1]["contents"][0]["parts"][-1]["text"].endswith("second")
+    client, fake, _ = make(tmp_path, (200, reply(GOOD)), (200, reply(GOOD)), prompt="first")
+    client.generate_csv(None, "", [pdf(tmp_path)])
+    client.prompt_file.write_text("second", encoding="utf-8")
+    client.generate_csv(None, "", [pdf(tmp_path)])
+    assert fake.bodies[0]["messages"][1]["content"][-1]["text"].endswith("first")
+    assert fake.bodies[1]["messages"][1]["content"][-1]["text"].endswith("second")
 
 
 def test_empty_prompt_file_fails_before_any_request(tmp_path):
-    gemini, fake, _ = make(tmp_path, prompt="  \n")
+    client, fake, _ = make(tmp_path, prompt="  \n")
     with pytest.raises(LLMError, match="prompt.txt is empty"):
-        gemini.generate_csv(None, "", [pdf(tmp_path)])
+        client.generate_csv(None, "", [pdf(tmp_path)])
     assert fake.requests == []
 
 
@@ -124,66 +144,64 @@ def test_empty_prompt_file_fails_before_any_request(tmp_path):
 
 
 def test_code_fence_around_the_csv_is_removed(tmp_path):
-    gemini, _, _ = make(tmp_path, (200, reply("```csv\n" + GOOD + "```")))
-    assert gemini.generate_csv(None, "", [pdf(tmp_path)]) == GOOD
+    client, _, _ = make(tmp_path, (200, reply("```csv\n" + GOOD + "```")))
+    assert client.generate_csv(None, "", [pdf(tmp_path)]) == GOOD
 
 
-def test_thought_parts_are_ignored(tmp_path):
-    payload = {"candidates": [{"finishReason": "STOP", "content": {"parts": [
-        {"text": "let me think", "thought": True}, {"text": GOOD}]}}]}
-    gemini, _, _ = make(tmp_path, (200, payload))
-    assert gemini.generate_csv(None, "", [pdf(tmp_path)]) == GOOD
+def test_reasoning_field_is_ignored(tmp_path):
+    client, _, _ = make(tmp_path, (200, reply(GOOD, reasoning="let me think")))
+    assert client.generate_csv(None, "", [pdf(tmp_path)]) == GOOD
 
 
 def test_invalid_csv_is_asked_for_once_more(tmp_path):
-    gemini, fake, _ = make(tmp_path, (200, reply("Sure! Here you go.")), (200, reply(GOOD)))
-    assert gemini.generate_csv(None, "", [pdf(tmp_path)]) == GOOD
+    client, fake, _ = make(tmp_path, (200, reply("Sure! Here you go.")), (200, reply(GOOD)))
+    assert client.generate_csv(None, "", [pdf(tmp_path)]) == GOOD
     assert len(fake.requests) == 2
 
 
 def test_two_unusable_csvs_fail_the_row(tmp_path):
-    gemini, fake, _ = make(tmp_path, (200, reply("a,b\n1,2,3\n")), (200, reply("a,b\n")))
+    client, fake, _ = make(tmp_path, (200, reply("a,b\n1,2,3\n")), (200, reply("a,b\n")))
     with pytest.raises(LLMError, match="no usable CSV after 2 attempts: the CSV has no data rows"):
-        gemini.generate_csv(None, "", [pdf(tmp_path)])
+        client.generate_csv(None, "", [pdf(tmp_path)])
     assert len(fake.requests) == 2
 
 
 def test_answer_cut_off_at_the_output_limit_is_an_error_not_a_partial_csv(tmp_path):
-    gemini, fake, _ = make(tmp_path, (200, reply(GOOD, finish="MAX_TOKENS")))
+    client, fake, _ = make(tmp_path, (200, reply(GOOD, finish="length")))
     with pytest.raises(LLMError, match="cut off"):
-        gemini.generate_csv(None, "", [pdf(tmp_path)])
+        client.generate_csv(None, "", [pdf(tmp_path)])
     assert len(fake.requests) == 1
 
 
-def test_blocked_prompt_is_an_error(tmp_path):
-    gemini, _, _ = make(tmp_path, (200, {"promptFeedback": {"blockReason": "SAFETY"}}))
-    with pytest.raises(LLMError, match="SAFETY"):
-        gemini.generate_csv(None, "", [pdf(tmp_path)])
+def test_empty_choices_is_an_error(tmp_path):
+    client, _, _ = make(tmp_path, (200, {"choices": []}))
+    with pytest.raises(LLMError, match="no choices"):
+        client.generate_csv(None, "", [pdf(tmp_path)])
 
 
 # -- errors and retries ------------------------------------------------------
 
 
 def test_rate_limit_is_retried_after_a_pause(tmp_path):
-    gemini, fake, sleeps = make(tmp_path, (429, {"error": {"message": "quota"}}), (503, {}), (200, reply(GOOD)))
-    assert gemini.generate_csv(None, "", [pdf(tmp_path)]) == GOOD
+    client, fake, sleeps = make(tmp_path, (429, {"error": {"message": "quota"}}), (503, {}), (200, reply(GOOD)))
+    assert client.generate_csv(None, "", [pdf(tmp_path)]) == GOOD
     assert sleeps == [5.0, 20.0]
     assert len(fake.requests) == 3
 
 
-def test_rate_limit_that_never_clears_reports_gemini_s_message(tmp_path):
+def test_rate_limit_that_never_clears_reports_nanogpt_message(tmp_path):
     error = (429, {"error": {"message": "You exceeded your current quota"}})
-    gemini, fake, sleeps = make(tmp_path, error, error, error)
+    client, fake, sleeps = make(tmp_path, error, error, error)
     with pytest.raises(LLMError, match="429: You exceeded your current quota"):
-        gemini.generate_csv(None, "", [pdf(tmp_path)])
+        client.generate_csv(None, "", [pdf(tmp_path)])
     assert len(fake.requests) == 3
     assert len(sleeps) == 2
 
 
 def test_bad_request_is_not_retried(tmp_path):
-    gemini, fake, sleeps = make(tmp_path, (400, {"error": {"message": "API key not valid"}}))
+    client, fake, sleeps = make(tmp_path, (400, {"error": {"message": "API key not valid"}}))
     with pytest.raises(LLMError, match="400: API key not valid"):
-        gemini.generate_csv(None, "", [pdf(tmp_path)])
+        client.generate_csv(None, "", [pdf(tmp_path)])
     assert len(fake.requests) == 1
     assert sleeps == []
 
@@ -194,9 +212,9 @@ def test_network_failure_is_an_llm_error_that_does_not_leak_the_key(tmp_path):
 
     prompt_file = tmp_path / "prompt.txt"
     prompt_file.write_text("p", encoding="utf-8")
-    gemini = GeminiLLM("secret-key", prompt_file=prompt_file, transport=httpx.MockTransport(boom))
-    with pytest.raises(LLMError, match="could not reach Gemini: ConnectError") as info:
-        gemini.generate_csv(None, "", [pdf(tmp_path)])
+    client = NanoGPTLLM("secret-key", prompt_file=prompt_file, transport=httpx.MockTransport(boom))
+    with pytest.raises(LLMError, match="could not reach NanoGPT: ConnectError") as info:
+        client.generate_csv(None, "", [pdf(tmp_path)])
     assert "secret-key" not in str(info.value)
 
 
@@ -234,23 +252,17 @@ def test_validate_csv_rejects(text, message):
 @pytest.fixture
 def env(monkeypatch):
     monkeypatch.setattr(llm, "load_dotenv", lambda *a, **k: None)
-    for name in ("LLM", "GEMINI_API_KEY", "GEMINI_MODEL"):
+    for name in ("LLM", "NANOGPT_API_KEY"):
         monkeypatch.delenv(name, raising=False)
     return monkeypatch
 
 
-def test_llm_from_env_defaults_to_gemini_with_the_default_model(env):
-    env.setenv("GEMINI_API_KEY", " key ")
+def test_llm_from_env_defaults_to_nanogpt_with_hydrogen_high(env):
+    env.setenv("NANOGPT_API_KEY", " key ")
     chosen = llm.llm_from_env()
-    assert isinstance(chosen, GeminiLLM)
-    assert chosen.model == "gemini-4-hydrogen"
-    assert chosen._http.headers["x-goog-api-key"] == "key"
-
-
-def test_llm_from_env_model_can_be_overridden(env):
-    env.setenv("GEMINI_API_KEY", "key")
-    env.setenv("GEMINI_MODEL", "gemini-3.5-flash")
-    assert llm.llm_from_env().model == "gemini-3.5-flash"
+    assert isinstance(chosen, NanoGPTLLM)
+    assert chosen.model == "google/gemini-4-hydrogen"
+    assert chosen._http.headers["authorization"] == "Bearer key"
 
 
 def test_llm_from_env_stub_needs_no_key(env):
@@ -259,18 +271,18 @@ def test_llm_from_env_stub_needs_no_key(env):
 
 
 def test_llm_from_env_without_a_key_is_a_config_error_not_a_silent_stub(env):
-    with pytest.raises(ConfigError, match="GEMINI_API_KEY"):
+    with pytest.raises(ConfigError, match="NANOGPT_API_KEY"):
         llm.llm_from_env()
 
 
 def test_llm_from_env_rejects_an_unknown_choice(env):
     env.setenv("LLM", "openai")
-    with pytest.raises(ConfigError, match="'gemini' or 'stub'"):
+    with pytest.raises(ConfigError, match="'nanogpt' or 'stub'"):
         llm.llm_from_env()
 
 
 def test_llm_from_env_needs_the_prompt_file(env, tmp_path):
-    env.setenv("GEMINI_API_KEY", "key")
+    env.setenv("NANOGPT_API_KEY", "key")
     env.setattr(llm, "DEFAULT_PROMPT_FILE", tmp_path / "missing.txt")
     with pytest.raises(ConfigError, match="missing.txt is missing"):
         llm.llm_from_env()

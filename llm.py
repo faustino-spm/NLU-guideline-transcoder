@@ -1,6 +1,7 @@
-"""LLM interface, a stub for wiring checks, and the Gemini implementation.
+"""LLM interface, a stub for wiring checks, and the NanoGPT implementation.
 
-`LLM=stub` in `.env` selects the stub; the default is Gemini (needs GEMINI_API_KEY).
+`LLM=stub` in `.env` selects the stub; the default is NanoGPT (needs NANOGPT_API_KEY)
+with the model hardcoded to Hydrogen High (`google/gemini-4-hydrogen`, `reasoning_effort="high"`).
 """
 
 from __future__ import annotations
@@ -23,13 +24,16 @@ from lark_base import ConfigError, load_dotenv
 log = logging.getLogger("llm")
 
 DEFAULT_PROMPT_FILE = Path(__file__).parent / "prompt.txt"
-DEFAULT_GEMINI_MODEL = "gemini-4-hydrogen"
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+NANOGPT_MODEL = "google/gemini-4-hydrogen"
+NANOGPT_REASONING_EFFORT = "high"
+NANOGPT_URL = "https://api.nano-gpt.com/api/v1/chat/completions"
 
 # What every request is told, whatever prompt.txt says, so the reply can be saved as a file as is.
 SYSTEM_INSTRUCTION = "Reply with the CSV only: a header row, then one record per line. No commentary, no code fences."
 
-# Types Gemini reads (https://ai.google.dev/gemini-api/docs/document-processing). Anything else fails the row.
+TEXT_SUFFIXES = {".txt", ".md", ".html", ".csv"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+
 MIME_BY_SUFFIX = {
     ".pdf": "application/pdf",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -76,7 +80,7 @@ class StubLLM:
         return buffer.getvalue()
 
 
-# -- Gemini ------------------------------------------------------------------
+# -- NanoGPT -----------------------------------------------------------------
 
 
 class LLMError(RuntimeError):
@@ -109,16 +113,31 @@ def validate_csv(text: str) -> None:
             raise LLMError(f"CSV row {number} has {len(row)} columns, the header has {width}")
 
 
-class GeminiLLM:
-    """Sends the row's files and prompt.txt to Gemini and returns the CSV it writes.
+def _attachment_part(path: Path) -> dict:
+    """Encode one attachment as an OpenAI-compatible chat content part."""
+    suffix = path.suffix.lower()
+    mime = MIME_BY_SUFFIX.get(suffix)
+    if mime is None:
+        raise LLMError(f"unsupported attachment type: {path.name}")
+    if suffix in TEXT_SUFFIXES:
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+        return {"type": "text", "text": f"Attachment ({path.name}):\n{text}"}
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    data_url = f"data:{mime};base64,{encoded}"
+    if suffix in IMAGE_SUFFIXES:
+        return {"type": "image_url", "image_url": {"url": data_url}}
+    return {"type": "file", "file": {"filename": path.name, "file_data": data_url}}
 
-    Files go inline in the request (no Files API). The prompt file is read on every call, so editing it
-    needs no restart; `{date}` and `{sub_campaign}` in it are replaced by the row's values. A reply that
-    is not a valid CSV is asked for once more, then the row fails.
-    Rate limits and server errors (429, 5xx) are retried with a pause.
+
+class NanoGPTLLM:
+    """Sends the row's files and prompt.txt to NanoGPT (Hydrogen High) and returns the CSV it writes.
+
+    The prompt file is read on every call, so editing it needs no restart; `{date}` and `{sub_campaign}`
+    in it are replaced by the row's values. A reply that is not a valid CSV is asked for once more,
+    then the row fails. Rate limits and server errors (429, 5xx) are retried with a pause.
     """
 
-    def __init__(self, api_key: str, model: str = DEFAULT_GEMINI_MODEL,
+    def __init__(self, api_key: str, model: str = NANOGPT_MODEL,
                  prompt_file: Path = DEFAULT_PROMPT_FILE, timeout: float = 300.0,
                  transport: httpx.BaseTransport | None = None,
                  sleep: Callable[[float], None] = time.sleep,
@@ -128,7 +147,7 @@ class GeminiLLM:
         self._sleep = sleep
         self._retry_delays = retry_delays
         self._http = httpx.Client(timeout=timeout, transport=transport,
-                                  headers={"x-goog-api-key": api_key})
+                                  headers={"Authorization": f"Bearer {api_key}"})
 
     def generate_csv(self, row_date: date | None, sub_campaign: str, files: list[Path]) -> str:
         body = self._request_body(row_date, sub_campaign, files)
@@ -151,71 +170,79 @@ class GeminiLLM:
         # The row's values reach the model only where the prompt asks for them.
         prompt = (prompt.replace("{date}", row_date.isoformat() if row_date else "unknown")
                   .replace("{sub_campaign}", sub_campaign or "unknown"))
-        parts: list[dict] = []
-        for path in files:
-            mime = MIME_BY_SUFFIX.get(path.suffix.lower())
-            if mime is None:
-                raise LLMError(f"unsupported attachment type: {path.name}")
-            parts.append({"inline_data": {"mime_type": mime,
-                                          "data": base64.b64encode(path.read_bytes()).decode("ascii")}})
-        parts.append({"text": prompt})
-        return {"system_instruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
-                "contents": [{"role": "user", "parts": parts}]}
+        parts = [_attachment_part(path) for path in files]
+        parts.append({"type": "text", "text": prompt})
+        return {
+            "model": self.model,
+            "reasoning_effort": NANOGPT_REASONING_EFFORT,
+            "messages": [
+                {"role": "system", "content": SYSTEM_INSTRUCTION},
+                {"role": "user", "content": parts},
+            ],
+        }
 
     def _call(self, body: dict) -> str:
-        """POST one generateContent request and return the reply text."""
-        url = GEMINI_URL.format(model=self.model)
+        """POST one chat completions request and return the reply text."""
         for attempt in range(len(self._retry_delays) + 1):
             try:
-                response = self._http.post(url, json=body)
+                response = self._http.post(NANOGPT_URL, json=body)
             except httpx.HTTPError as exc:
-                raise LLMError(f"could not reach Gemini: {type(exc).__name__}") from exc
+                raise LLMError(f"could not reach NanoGPT: {type(exc).__name__}") from exc
             if response.status_code in RETRY_STATUSES and attempt < len(self._retry_delays):
                 delay = self._retry_delays[attempt]
-                log.warning("Gemini returned %s, retrying in %.0fs", response.status_code, delay)
+                log.warning("NanoGPT returned %s, retrying in %.0fs", response.status_code, delay)
                 self._sleep(delay)
                 continue
             break
         if response.status_code != 200:
-            raise LLMError(f"Gemini returned {response.status_code}: {_api_error(response)}")
+            raise LLMError(f"NanoGPT returned {response.status_code}: {_api_error(response)}")
         return _reply_text(response.json())
 
 
 def _api_error(response: httpx.Response) -> str:
     try:
-        return str(response.json()["error"]["message"])[:300]
+        err = response.json()["error"]
+        if isinstance(err, dict):
+            return str(err["message"])[:300]
+        return str(err)[:300]
     except (ValueError, KeyError, TypeError):
         return response.text[:300]
 
 
 def _reply_text(data: dict) -> str:
-    candidates = data.get("candidates") or []
-    if not candidates:
-        reason = (data.get("promptFeedback") or {}).get("blockReason", "no candidates")
-        raise LLMError(f"Gemini returned no answer ({reason})")
-    candidate = candidates[0]
-    finish = candidate.get("finishReason", "")
-    if finish == "MAX_TOKENS":
+    choices = data.get("choices") or []
+    if not choices:
+        raise LLMError("NanoGPT returned no answer (no choices)")
+    choice = choices[0]
+    finish = choice.get("finish_reason") or ""
+    if finish == "length":
         raise LLMError("the answer was cut off at the model's output limit, so the CSV is incomplete")
-    parts = (candidate.get("content") or {}).get("parts") or []
-    text = "".join(part.get("text", "") for part in parts if not part.get("thought"))
-    if not text.strip() and finish not in ("", "STOP"):
-        raise LLMError(f"Gemini stopped without an answer ({finish})")
+    message = choice.get("message") or {}
+    content = message.get("content")
+    if isinstance(content, list):
+        text = "".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    else:
+        text = content or ""
+    if not text.strip() and finish not in ("", "stop"):
+        raise LLMError(f"NanoGPT stopped without an answer ({finish})")
     return text
 
 
 def llm_from_env() -> LLM:
-    """Gemini by default; `LLM=stub` in the environment selects the stub."""
+    """NanoGPT (Hydrogen High) by default; `LLM=stub` in the environment selects the stub."""
     load_dotenv()
-    choice = os.environ.get("LLM", "gemini").strip().lower()
+    choice = os.environ.get("LLM", "nanogpt").strip().lower()
     if choice == "stub":
         return StubLLM()
-    if choice != "gemini":
-        raise ConfigError(f"LLM must be 'gemini' or 'stub', got {choice!r}")
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if choice != "nanogpt":
+        raise ConfigError(f"LLM must be 'nanogpt' or 'stub', got {choice!r}")
+    api_key = os.environ.get("NANOGPT_API_KEY", "").strip()
     if not api_key:
-        raise ConfigError("GEMINI_API_KEY is not set (set LLM=stub to run without Gemini)")
+        raise ConfigError("NANOGPT_API_KEY is not set (set LLM=stub to run without NanoGPT)")
     if not DEFAULT_PROMPT_FILE.is_file():
         raise ConfigError(f"{DEFAULT_PROMPT_FILE.name} is missing")
-    model = os.environ.get("GEMINI_MODEL", "").strip() or DEFAULT_GEMINI_MODEL
-    return GeminiLLM(api_key, model)
+    return NanoGPTLLM(api_key, NANOGPT_MODEL)
