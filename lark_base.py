@@ -1,4 +1,4 @@
-"""Lark Base (Bitable) client that authenticates as the app (tenant access token).
+"""Read-only Lark Base (Bitable) client that authenticates as the app (tenant access token).
 
 Configuration (environment variables, or a `.env` file in the working directory):
     LARK_APP_ID, LARK_APP_SECRET   required
@@ -9,12 +9,13 @@ Configuration (environment variables, or a `.env` file in the working directory)
                                    midnight; this is the offset used to turn them into dates.
 
 Prerequisites in the Lark developer console and the Base:
-    * the app has the `bitable:app` scope (tenant token scopes) and a released version
-    * the app was added to the Base as a document app with edit rights.
+    * the app has a Base read scope (`bitable:app:readonly` or `bitable:app`, tenant token scopes)
+      and a released version
+    * the app has read access to the Base (added as a document app with at least view rights).
       Scopes decide which APIs the app may call; this decides which Bases it may touch.
 
 CLI:
-    python lark_base.py list      # row count, missing columns, and the ticked rows
+    python lark_base.py list      # row count, missing columns, and all rows
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import httpx
 
 DEFAULT_DOMAIN = "https://open.larksuite.com"
 
+
 def load_dotenv(path: str | os.PathLike[str] = ".env") -> None:
     """Load KEY=VALUE lines into os.environ without overriding existing variables."""
     file = Path(path)
@@ -50,27 +52,22 @@ def load_dotenv(path: str | os.PathLike[str] = ".env") -> None:
         os.environ.setdefault(key, value)
 
 
-# Column names in the grid. Change them here if the grid is renamed.
+# Column names read from the grid. Change them here if the grid is renamed.
 FIELD_DATE = "Data Collection Date"
 FIELD_SUBCAMPAIGN = "Sub-campaign (Doc Class 6)"
 FIELD_ATTACHMENT = "QA Guidelines/PhoneMon (Bank)"
-FIELD_PROCESS = "Process Row?"
-FIELD_STATUS = "Status"
-FIELD_OUTPUT = "Output CSV for NLU"
-EXPECTED_FIELDS = (FIELD_DATE, FIELD_SUBCAMPAIGN, FIELD_ATTACHMENT, FIELD_PROCESS, FIELD_STATUS, FIELD_OUTPUT)
+EXPECTED_FIELDS = (FIELD_DATE, FIELD_SUBCAMPAIGN, FIELD_ATTACHMENT)
 
 TOKEN_SLACK_SECONDS = 300
-# The media download and upload APIs each allow 5 requests per second; stay below that.
+# The media download API allows 5 requests per second; stay below that.
 DOWNLOAD_MIN_INTERVAL = 0.25
-# The simple upload call accepts files up to 20 MB.
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 # Lark error codes for a missing, invalid or expired access token.
 INVALID_TOKEN_CODES = {99991661, 99991663, 99991668}
 # Error codes that usually mean the app has no access to the Base.
 PERMISSION_CODES = {91403, 99991672, 99991679}
 PERMISSION_HINT = (
-    "Check that the app has the `bitable:app` scope (with a released version) "
-    "and was added to the Base as an editor."
+    "Check that the app has a Base read scope (e.g. `bitable:app:readonly` or `bitable:app`, "
+    "with a released version) and has read access to the Base."
 )
 
 
@@ -144,7 +141,7 @@ class TenantTokenProvider:
 
 
 class BaseClient:
-    """Reads and updates records of one table. `tokens` needs a `get(force_refresh=False)` method."""
+    """Reads records and downloads attachments from one table. `tokens` needs `get(force_refresh=False)`."""
 
     def __init__(self, tokens: Any, app_token: str, table_id: str, domain: str = DEFAULT_DOMAIN,
                  http: httpx.Client | None = None):
@@ -154,24 +151,6 @@ class BaseClient:
         self._domain = domain.rstrip("/")
         self._http = http or httpx.Client(timeout=30.0)
         self._last_media_call = 0.0
-        self._media_parent: str | None = None
-
-    def _upload_target(self) -> str:
-        """The token an upload must name as its parent.
-
-        A Base opened from a wiki is addressed by its wiki node token in the records API, but
-        uploads need the Base's own token, which the wiki node lookup returns. A token that is
-        not a wiki node (or a failed lookup) is used as given.
-        """
-        if self._media_parent is None:
-            self._media_parent = self.app_token
-            try:
-                node = self._call("GET", "/wiki/v2/spaces/get_node", params={"token": self.app_token}).get("node") or {}
-                if node.get("obj_type") == "bitable" and node.get("obj_token"):
-                    self._media_parent = str(node["obj_token"])
-            except (LarkApiError, httpx.HTTPError):
-                pass
-        return self._media_parent
 
     def _throttle_media(self) -> None:
         wait = self._last_media_call + DOWNLOAD_MIN_INTERVAL - time.monotonic()
@@ -227,40 +206,6 @@ class BaseClient:
             page_token = data.get("page_token")
             if not data.get("has_more") or not page_token:
                 return fields
-
-    def update_record(self, record_id: str, fields: dict[str, Any]) -> dict[str, Any]:
-        """Incremental update: only the given fields change."""
-        data = self._call("PUT", f"{self._table_path}/records/{record_id}", json={"fields": fields})
-        return data.get("record") or {}
-
-    def upload_media(self, file_name: str, content: bytes) -> str:
-        """Upload a file into this Base and return its file token.
-
-        Put the token in an attachment column with `update_record(id, {column: [{"file_token": token}]})`.
-        Lark's simple upload takes files up to 20 MB and 5 requests per second.
-        """
-        if len(content) > MAX_UPLOAD_BYTES:
-            raise ValueError(f"{file_name} is {len(content)} bytes; Lark's upload accepts at most 20 MB")
-        self._throttle_media()
-        parent = self._upload_target()
-        try:
-            data = self._call(
-                "POST", "/drive/v1/medias/upload_all",
-                data={"file_name": file_name, "parent_type": "bitable_file",
-                      "parent_node": parent, "size": str(len(content)),
-                      "extra": json.dumps({"drive_route_token": parent})},
-                files={"file": (file_name, content, "text/csv")},
-            )
-        except LarkApiError as exc:
-            if exc.code == 1061044:  # parent node not found
-                raise LarkApiError(exc.code, f"{exc.msg}. If the Base is opened from a wiki, the app may "
-                                   "lack access to read the wiki node that holds the Base's own token",
-                                   exc.http_status) from exc
-            raise
-        token = data.get("file_token")
-        if not token:
-            raise LarkApiError(None, "the upload returned no file_token")
-        return str(token)
 
     def download_media(self, file_token: str, dest: Path, extra: str | None = None) -> Path:
         """Download an attachment's bytes to `dest`. Throttled to stay under 5 requests per second.
@@ -384,17 +329,16 @@ def cmd_list(client: BaseClient) -> int:
         for name in missing:
             print(f"  - {name}")
     records = client.list_records()
-    ticked = [r for r in records if (r.get("fields") or {}).get(FIELD_PROCESS) is True]
-    print(f"{len(records)} rows, {len(ticked)} with '{FIELD_PROCESS}' ticked.")
-    for record in ticked:
+    print(f"{len(records)} row(s):")
+    for record in records:
         print("  " + _describe_row(record))
     return 1 if missing else 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Lark Base client.")
+    parser = argparse.ArgumentParser(description="Read-only Lark Base client.")
     parser.add_subparsers(dest="command", required=True).add_parser(
-        "list", help="show row count, missing columns and ticked rows")
+        "list", help="show missing columns and all rows")
     parser.parse_args(argv)
     try:
         return cmd_list(client_from_env())

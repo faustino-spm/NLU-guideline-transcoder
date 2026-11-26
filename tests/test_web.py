@@ -1,25 +1,27 @@
 import importlib
 import sys
 import threading
+from urllib.parse import unquote
 
 import pytest
 from fastapi.testclient import TestClient
 
 import web
-from fakes import FakeClient, attachment, record
-from lark_base import FIELD_OUTPUT, FIELD_PROCESS, FIELD_STATUS, ConfigError, LarkApiError
+from fakes import FakeClient, record
+from lark_base import ConfigError, LarkApiError
 from llm import StubLLM
 
 KEY = "s3cret"
 
 
 class CountingLLM:
-    def __init__(self):
+    def __init__(self, csv_text: str = "a,b\n1,2\n"):
         self.calls = 0
+        self.csv_text = csv_text
 
     def generate_csv(self, row_date, sub_campaign, files):
         self.calls += 1
-        return "a,b\n1,2\n"
+        return self.csv_text
 
 
 class BlockingLLM(CountingLLM):
@@ -51,13 +53,13 @@ def make(records, llm=None, run_key=KEY, client=None, **kwargs):
 # -- key check ---------------------------------------------------------------
 
 
-@pytest.mark.parametrize("method, path", [("get", "/run"), ("post", "/run"), ("get", "/status")])
+@pytest.mark.parametrize("method, path", [("get", "/run"), ("post", "/run")])
 @pytest.mark.parametrize("params", [{}, {"key": "wrong"}, {"key": ""}])
 def test_every_page_needs_the_key(method, path, params):
     site, client, llm = make([record("r1")])
     response = getattr(site, method)(path, params=params, follow_redirects=False)
     assert response.status_code == 403
-    assert client.updates == [] and llm.calls == 0
+    assert client.downloads == [] and llm.calls == 0
 
 
 def test_the_app_refuses_to_start_without_a_run_key():
@@ -65,38 +67,42 @@ def test_the_app_refuses_to_start_without_a_run_key():
         web.create_app(FakeClient([]), StubLLM(), "")
 
 
-def test_api_docs_are_not_exposed():
+def test_api_docs_and_status_are_not_exposed():
     site, *_ = make([])
     assert site.get("/docs").status_code == 404
     assert site.get("/openapi.json").status_code == 404
+    assert site.get("/status", params={"key": KEY}).status_code == 404
 
 
-# -- confirmation page -------------------------------------------------------
+# -- row selection page ------------------------------------------------------
 
 
-def test_get_run_lists_ticked_rows_and_changes_nothing():
-    site, client, llm = make([record("r1"), record("r2", ticked=False), record("r3")])
+def test_get_run_lists_all_rows_with_checkboxes_and_changes_nothing():
+    site, client, llm = make([record("r1"), record("r2", sub_campaign="Class B")])
     response = site.get("/run", params={"key": KEY})
 
     assert response.status_code == 200
-    assert "r1" in response.text and "r3" in response.text and "r2" not in response.text
-    assert "Run 2 row(s)" in response.text
+    assert 'name="record_id" value="r1"' in response.text
+    assert 'name="record_id" value="r2"' in response.text
+    assert "Class A" in response.text and "Class B" in response.text
+    assert "Run selected rows" in response.text
     assert 'method="post"' in response.text
-    assert client.updates == [] and llm.calls == 0  # a link preview or double click starts nothing
+    assert client.downloads == [] and llm.calls == 0
 
 
-def test_get_run_with_nothing_ticked_has_no_run_button():
-    site, *_ = make([record("r1", ticked=False)])
+def test_get_run_with_empty_grid_has_no_run_button():
+    site, *_ = make([])
     text = site.get("/run", params={"key": KEY}).text
-    assert "No rows are ticked" in text
+    assert "No rows found in the grid" in text
     assert "<button" not in text
 
 
-def test_the_key_is_url_encoded_in_links_and_the_form_action():
+def test_the_key_is_url_encoded_in_the_form_action_and_back_link():
     site, *_ = make([record("r1")], run_key="k&1 x")
-    text = site.get("/run", params={"key": "k&1 x"}).text
-    assert 'action="/run?key=k%261%20x"' in text
-    assert 'href="/status?key=k%261%20x"' in text
+    get_text = site.get("/run", params={"key": "k&1 x"}).text
+    assert 'action="/run?key=k%261%20x"' in get_text
+    post_text = site.post("/run", params={"key": "k&1 x"}, data={"record_id": "r1"}).text
+    assert 'href="/run?key=k%261%20x"' in post_text
 
 
 def test_row_data_is_html_escaped():
@@ -116,115 +122,76 @@ def test_an_unreadable_grid_gives_502_with_the_reason():
 # -- running -----------------------------------------------------------------
 
 
-def test_post_run_processes_the_ticked_rows_and_reports_each_one():
-    site, client, llm = make([record("r1"), record("r2", ticked=False)])
-    response = site.post("/run", params={"key": KEY})
+def test_post_run_processes_selected_rows_and_embeds_downloadable_csv():
+    site, client, llm = make([record("r1"), record("r2")], llm=CountingLLM("col1,col2\n<v>,2\n"))
+    response = site.post("/run", params={"key": KEY}, data={"record_id": ["r2"]})
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
     assert llm.calls == 1
-    assert client.records["r1"]["fields"][FIELD_STATUS] == "Integrated"
-    assert client.records["r1"]["fields"][FIELD_PROCESS] is False
-    assert client.records["r1"]["fields"][FIELD_OUTPUT] == [{"file_token": "up1"}]
-    assert client.records["r2"]["fields"][FIELD_STATUS] == "Not Processed"
-    assert "2026-03-01_r1.csv" in response.text
-    assert "Done: 1 integrated, 0 failed." in response.text
-    assert "still ticked" not in response.text
+    assert client.downloads == ["tok-r2"]
+    assert "2026-03-01_r2.csv" in response.text
+    assert "data:text/csv;charset=utf-8," in response.text
+    # Check the embedded data URI decodes to the exact CSV text and the preview is HTML-escaped.
+    uri = response.text.split('href="data:text/csv;charset=utf-8,', 1)[1].split('"', 1)[0]
+    assert unquote(uri) == "col1,col2\n<v>,2\n"
+    assert "&lt;v&gt;,2" in response.text
+    assert "Done: 1 succeeded, 0 failed." in response.text
+    assert "not reached" not in response.text
     assert response.text.rstrip().endswith("</html>")
 
 
-def test_post_run_with_nothing_ticked_says_so():
-    site, client, llm = make([record("r1", ticked=False)])
+def test_post_run_with_nothing_selected_says_so():
+    site, client, llm = make([record("r1")])
     text = site.post("/run", params={"key": KEY}).text
-    assert "No rows were ticked." in text
-    assert client.updates == [] and llm.calls == 0
+    assert "No rows were selected." in text
+    assert client.downloads == [] and llm.calls == 0
 
 
-def test_rows_not_reached_before_the_budget_ends_stay_ticked_and_are_reported():
-    site, client, llm = make([record("r1"), record("r2")], budget_seconds=0)
-    text = site.post("/run", params={"key": KEY}).text
+def test_rows_not_reached_before_the_budget_ends_are_reported():
+    site, _, llm = make([record("r1"), record("r2")], budget_seconds=0)
+    text = site.post("/run", params={"key": KEY}, data={"record_id": ["r1", "r2"]}).text
     assert llm.calls == 0
-    assert "2 row(s) are still ticked" in text
-    assert client.records["r1"]["fields"][FIELD_PROCESS] is True
+    assert "2 selected row(s) were not reached" in text
+    assert "r1, r2" in text
 
 
 def test_a_failed_row_is_shown_with_its_reason_and_counted():
-    site, client, _ = make([record("r1", attachments=None), record("r2")])
-    text = site.post("/run", params={"key": KEY}).text
+    site, _, _ = make([record("r1", attachments=None), record("r2")])
+    text = site.post("/run", params={"key": KEY}, data={"record_id": ["r1", "r2"]}).text
     assert "no attachment" in text
-    assert "Done: 1 integrated, 1 failed." in text
-    assert client.records["r1"]["fields"][FIELD_STATUS] == "Failed"
+    assert "Done: 1 succeeded, 1 failed." in text
 
 
 def test_a_run_that_cannot_read_the_grid_says_so_and_releases_the_lock():
     broken = DownClient([])
     site, *_ = make([], client=broken)
-    text = site.post("/run", params={"key": KEY}).text
+    text = site.post("/run", params={"key": KEY}, data={"record_id": ["r1"]}).text
     assert "Run failed" in text and "91403" in text
-    assert "already in progress" not in site.post("/run", params={"key": KEY}).text
+    assert "already in progress" not in site.post("/run", params={"key": KEY}, data={"record_id": ["r1"]}).text
 
 
 def test_a_second_run_in_the_same_process_is_refused_while_one_is_going():
     llm = BlockingLLM()
-    site, client, _ = make([record("r1")], llm=llm)
+    site, _, _ = make([record("r1")], llm=llm)
     other = TestClient(site.app)
     first = {}
-    runner = threading.Thread(target=lambda: first.update(text=site.post("/run", params={"key": KEY}).text))
+    runner = threading.Thread(
+        target=lambda: first.update(text=site.post("/run", params={"key": KEY}, data={"record_id": "r1"}).text)
+    )
     runner.start()
     try:
         assert llm.started.wait(5)
-        second = other.post("/run", params={"key": KEY}).text
+        second = other.post("/run", params={"key": KEY}, data={"record_id": "r1"}).text
         assert "already in progress" in second
     finally:
         llm.release.set()
         runner.join(10)
 
     assert llm.calls == 1
-    assert "Done: 1 integrated, 0 failed." in first["text"]
+    assert "Done: 1 succeeded, 0 failed." in first["text"]
     # once finished, a new run can start again
-    client.records["r1"]["fields"][FIELD_PROCESS] = True
-    assert "Done: 1 integrated" in site.post("/run", params={"key": KEY}).text
-
-
-# -- status page -------------------------------------------------------------
-
-
-def test_status_lists_processed_rows_from_the_grid():
-    site, *_ = make([
-        record("r1", ticked=False, status="Integrated", output=[attachment("t", "2026-03-01_r1.csv")]),
-        record("r2", ticked=False, status="Failed"),
-        record("r3", ticked=False, status="Queued"),
-        record("r4", ticked=False, status="Not Processed"),
-        record("r5", ticked=False, status=None),
-    ])
-    text = site.get("/status", params={"key": KEY}).text
-    assert "r1" in text and "Integrated" in text and "2026-03-01_r1.csv" in text
-    assert "r2" in text and "Failed" in text
-    assert "r3" in text and "Queued" in text
-    assert "r4" not in text and "r5" not in text
-
-
-def test_status_needs_no_memory_of_an_earlier_request():
-    site, client, _ = make([record("r1")])
-    site.post("/run", params={"key": KEY})
-    fresh = TestClient(web.create_app(client, CountingLLM(), KEY))  # a different instance
-    assert "Integrated" in fresh.get("/status", params={"key": KEY}).text
-
-
-def test_status_with_nothing_processed():
-    site, *_ = make([record("r1", status="Not Processed")])
-    assert "No row has been processed yet" in site.get("/status", params={"key": KEY}).text
-
-
-def test_status_escapes_row_data():
-    site, *_ = make([record("r1", ticked=False, status="Integrated", sub_campaign="<b>x</b>")])
-    text = site.get("/status", params={"key": KEY}).text
-    assert "<b>x</b>" not in text and "&lt;b&gt;" in text
-
-
-def test_status_with_an_unreadable_grid_gives_502():
-    site, *_ = make([], client=DownClient([]))
-    assert site.get("/status", params={"key": KEY}).status_code == 502
+    assert "Done: 1 succeeded" in site.post("/run", params={"key": KEY}, data={"record_id": "r1"}).text
 
 
 # -- configuration and entrypoint --------------------------------------------
@@ -242,7 +209,7 @@ def env(monkeypatch):
 
 def test_app_from_env_builds_a_working_app(env):
     site = TestClient(web.app_from_env())
-    assert "Run 1 row(s)" in site.get("/run", params={"key": KEY}).text
+    assert "Run selected rows" in site.get("/run", params={"key": KEY}).text
 
 
 def test_app_from_env_reads_the_budget(env):
