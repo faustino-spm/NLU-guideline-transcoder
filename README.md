@@ -95,7 +95,7 @@ Not yet deployed or tested on Vercel. The configuration follows Vercel's documen
 
 Time limit: `vercel.json` sets the function's `maxDuration` to 300 seconds, the maximum on the Hobby plan.
 `RUN_BUDGET_SECONDS` must stay well below it, because a row that has started is never cut short by the app.
-A row takes one Lark download, one Gemini call (up to 120 seconds, and a second call if the first reply is not
+A row takes one Lark download, one Gemini call (waits up to 300 seconds, and a second call if the first reply is not
 a valid CSV) and one upload. If Vercel ends the request while a row is running, that row stays `Queued`: tick it
 again. On a plan with a longer limit, raise `maxDuration` in `vercel.json` and `RUN_BUDGET_SECONDS` together.
 

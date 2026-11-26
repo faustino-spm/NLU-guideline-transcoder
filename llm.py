@@ -119,7 +119,7 @@ class GeminiLLM:
     """
 
     def __init__(self, api_key: str, model: str = DEFAULT_GEMINI_MODEL,
-                 prompt_file: Path = DEFAULT_PROMPT_FILE, timeout: float = 120.0,
+                 prompt_file: Path = DEFAULT_PROMPT_FILE, timeout: float = 300.0,
                  transport: httpx.BaseTransport | None = None,
                  sleep: Callable[[float], None] = time.sleep,
                  retry_delays: tuple[float, ...] = (5.0, 20.0)):
