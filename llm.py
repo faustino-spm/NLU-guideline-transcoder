@@ -40,7 +40,7 @@ DEFAULT_PROMPT_FILE = Path(__file__).parent / "prompt.txt"
 
 # OpenAI-compatible endpoints
 NANOGPT_MODEL = "google/gemini-4-hydrogen"
-NANOGPT_REASONING_EFFORT = "high"
+NANOGPT_REASONING_EFFORT = "medium"
 NANOGPT_URL = "https://api.nano-gpt.com/api/v1/chat/completions"
 
 OPENAI_MODEL = "gpt-5"
@@ -49,7 +49,7 @@ OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 
 # Google Gemini native API
 GEMINI_MODEL = "gemini-4-hydrogen"
-GEMINI_THINKING_LEVEL: str | None = "high"
+GEMINI_THINKING_LEVEL: str | None = "medium"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 # What every request is told, whatever prompt.txt says, so the reply can be saved as a file as is.
