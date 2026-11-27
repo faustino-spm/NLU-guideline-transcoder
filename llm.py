@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Callable, Protocol
 
 import httpx
+import xlrd
 
 from lark_base import ConfigError, load_dotenv
 from prompts import validate_prompts_exist
@@ -57,7 +58,7 @@ SYSTEM_INSTRUCTION = "Reply with the CSV only: a header row, then one record per
 
 TEXT_SUFFIXES = {".txt", ".md", ".html", ".csv"}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
-OFFICE_SUFFIXES = {".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp"}
+OFFICE_SUFFIXES = {".docx", ".xlsx", ".xls", ".pptx", ".odt", ".ods", ".odp"}
 
 MIME_BY_SUFFIX = {
     ".pdf": "application/pdf",
@@ -66,6 +67,7 @@ MIME_BY_SUFFIX = {
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     ".odp": "application/vnd.oasis.opendocument.presentation",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls": "application/vnd.ms-excel",
     ".ods": "application/vnd.oasis.opendocument.spreadsheet",
     ".txt": "text/plain",
     ".md": "text/markdown",
@@ -408,9 +410,61 @@ def _extract_odf(zf: zipfile.ZipFile) -> tuple[str, list[tuple[str, str]]]:
     return "\n".join(line for line in lines if line), _extract_embedded_images(zf, "Pictures/")
 
 
+def _format_xls_cell(cell: xlrd.sheet.Cell, epoch_1904: bool) -> str:
+    ctype = cell.ctype
+    val = cell.value
+    if ctype in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK):
+        return ""
+    if ctype == xlrd.XL_CELL_TEXT:
+        return str(val).strip()
+    if ctype == xlrd.XL_CELL_NUMBER:
+        if isinstance(val, float) and val.is_integer():
+            return str(int(val))
+        return f"{val:.15g}" if isinstance(val, float) else str(val)
+    if ctype == xlrd.XL_CELL_DATE:
+        return _format_excel_serial_date(str(val), epoch_1904)
+    if ctype == xlrd.XL_CELL_BOOLEAN:
+        return "TRUE" if val else "FALSE"
+    if ctype == xlrd.XL_CELL_ERROR:
+        return xlrd.error_text_from_code.get(val, "")
+    return str(val).strip()
+
+
+def _extract_xls(path: Path) -> tuple[str, list[tuple[str, str]]]:
+    try:
+        wb = xlrd.open_workbook(file_contents=path.read_bytes())
+    except (xlrd.biffh.XLRDError, ValueError, OSError) as exc:
+        raise LLMError(f"could not read {path.name}: {type(exc).__name__}") from exc
+
+    epoch_1904 = bool(wb.datemode)
+    sections: list[str] = []
+    for sheet in wb.sheets():
+        buf = io.StringIO()
+        writer = csv.writer(buf, lineterminator="\n")
+        row_count = 0
+        for row_idx in range(sheet.nrows):
+            vals = [_format_xls_cell(sheet.cell(row_idx, col_idx), epoch_1904) for col_idx in range(sheet.ncols)]
+            while vals and vals[-1] == "":
+                vals.pop()
+            if any(vals):
+                writer.writerow(vals)
+                row_count += 1
+        if row_count:
+            sections.append(f"=== Sheet: {sheet.name} ===\n" + buf.getvalue().rstrip("\n"))
+    return "\n\n".join(sections), []
+
+
 def _extract_office_content(path: Path) -> tuple[str, list[tuple[str, str]]]:
-    """Extract text and `(mime, base64_data)` embedded images from ZIP-based Office/OpenDocument files."""
+    """Extract text and `(mime, base64_data)` embedded images from Office/OpenDocument files."""
     suffix = path.suffix.lower()
+    if suffix == ".xls":
+        if zipfile.is_zipfile(path):
+            try:
+                with zipfile.ZipFile(path) as zf:
+                    return _extract_xlsx(zf)
+            except (zipfile.BadZipFile, ET.ParseError, KeyError, OSError) as exc:
+                raise LLMError(f"could not read {path.name}: {type(exc).__name__}") from exc
+        return _extract_xls(path)
     try:
         with zipfile.ZipFile(path) as zf:
             if suffix == ".docx":

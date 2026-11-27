@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import struct
 import zipfile
 from datetime import date
 
@@ -190,6 +191,87 @@ def test_every_file_is_sent_in_order_by_type(tmp_path):
     assert parts[5]["type"] == "file"
     assert parts[5]["file"]["file_data"].startswith("data:application/pdf;base64,")
     assert parts[6] == {"type": "text", "text": "Parse it."}
+
+
+def make_xls(tmp_path, name="sheet.xls"):
+    """Build a minimal valid BIFF8 .xls file readable by xlrd."""
+    def rec(opcode: int, data: bytes) -> bytes:
+        return struct.pack("<HH", opcode, len(data)) + data
+
+    def label(row: int, col: int, text: str, xf: int = 0) -> bytes:
+        raw = text.encode("latin1")
+        return rec(0x0204, struct.pack("<HHHHB", row, col, xf, len(raw), 0) + raw)
+
+    def number(row: int, col: int, value: float, xf: int = 0) -> bytes:
+        return rec(0x0203, struct.pack("<HHHd", row, col, xf, value))
+
+    def boolean(row: int, col: int, value: bool, xf: int = 0) -> bytes:
+        return rec(0x0205, struct.pack("<HHHBB", row, col, xf, 1 if value else 0, 0))
+
+    sheet_name = b"Calibration"
+    pre_boundsheet = b"".join([
+        rec(0x0809, struct.pack("<HHHHII", 0x0600, 0x0005, 0, 0, 0, 0)),  # BOF (workbook)
+        rec(0x0042, struct.pack("<H", 1200)),  # CODEPAGE
+        rec(0x0022, struct.pack("<H", 0)),  # DATEMODE (1900)
+        rec(0x00E0, struct.pack("<HHH14s", 0, 0, 0, b"\x00" * 14)),  # XF 0: General
+        rec(0x00E0, struct.pack("<HHH14s", 0, 14, 0, b"\x00" * 14)),  # XF 1: Built-in Date (14)
+    ])
+    boundsheet_payload_len = 4 + 2 + 1 + 1 + len(sheet_name)
+    eof_rec = rec(0x000A, b"")
+    ws_offset = len(pre_boundsheet) + 4 + boundsheet_payload_len + len(eof_rec)
+    boundsheet = rec(0x0085, struct.pack("<IHBB", ws_offset, 0, len(sheet_name), 0) + sheet_name)
+
+    worksheet = b"".join([
+        rec(0x0809, struct.pack("<HHHHII", 0x0600, 0x0010, 0, 0, 0, 0)),  # BOF (worksheet)
+        label(0, 0, "Agent"),
+        label(0, 1, "Score"),
+        label(0, 2, "Date"),
+        label(1, 0, "Ann"),
+        number(1, 1, 40.0),
+        number(1, 2, 46082.0, xf=1),
+        label(2, 0, "Bob"),
+        number(2, 1, 0.1 + 0.2),
+        boolean(2, 2, True),
+        eof_rec,
+    ])
+    path = tmp_path / name
+    path.write_bytes(pre_boundsheet + boundsheet + eof_rec + worksheet)
+    return path
+
+
+def test_xls_is_extracted_for_openai_and_gemini(tmp_path):
+    xls_path = make_xls(tmp_path, "legacy.xls")
+    expected = (
+        "Attachment (legacy.xls):\n"
+        "=== Sheet: Calibration ===\n"
+        "Agent,Score,Date\n"
+        "Ann,40,2026-03-01\n"
+        "Bob,0.3,TRUE"
+    )
+
+    openai_client, openai_fake, _ = make(tmp_path, (200, reply(GOOD)))
+    openai_client.generate_csv(None, "", [xls_path])
+    assert openai_fake.bodies[0]["messages"][1]["content"][0] == {"type": "text", "text": expected}
+
+    gemini_client, gemini_fake, _ = make_gemini(tmp_path, (200, gemini_reply(GOOD)))
+    gemini_client.generate_csv(None, "", [xls_path])
+    assert gemini_fake.bodies[0]["contents"][0]["parts"][0] == {"text": expected}
+
+
+def test_misnamed_xlsx_with_xls_extension_and_corrupt_xls(tmp_path):
+    # Some exports save OOXML (.xlsx) files with a .xls extension.
+    misnamed = make_xlsx(tmp_path, "actually_xlsx.xls")
+    client, fake, _ = make(tmp_path, (200, reply(GOOD)))
+    client.generate_csv(None, "", [misnamed])
+    assert fake.bodies[0]["messages"][1]["content"][0] == {
+        "type": "text",
+        "text": "Attachment (actually_xlsx.xls):\n=== Sheet: Calibration ===\nAgent,Note,Date\nAnn,,2026-03-01",
+    }
+
+    corrupt = tmp_path / "broken.xls"
+    corrupt.write_bytes(b"not an excel file")
+    with pytest.raises(LLMError, match=r"could not read broken\.xls: XLRDError"):
+        client.generate_csv(None, "", [corrupt])
 
 
 def test_unsupported_file_type_fails_before_any_request(tmp_path):
