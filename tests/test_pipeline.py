@@ -247,9 +247,90 @@ def test_a_row_without_a_date_gets_a_no_date_file_name():
 
 
 def test_rerunning_a_row_replaces_its_csv():
-    client = FakeClient([record("rec1", output=[attachment("old", "old.csv", 9, "text/csv")])])
+    client = FakeClient([record("rec1", output=[attachment("old", "2026-03-01_rec1.csv", 9, "text/csv")])])
     run(client, RecordingLLM(csv_text="v\n2\n"))
     assert client.records["rec1"]["fields"][FIELD_OUTPUT] == [{"file_token": "up1"}]
+
+
+def test_rerunning_single_disposition_preserves_other_disposition_attachments():
+    import prompts
+
+    class DispositionLLM:
+        def __init__(self, csv_by_call: list[str]):
+            self.csv_by_call = list(csv_by_call)
+
+        def generate_csv(self, row_date, sub_campaign, files, *, prompt_text=None):
+            return self.csv_by_call.pop(0)
+
+    initial_csv = (
+        "Rule Name,Placement Name\n"
+        "CLASS_A_RIGHT_PARTY_CONTACT,default_placement\n"
+        "CLASS_A_PTP,default_placement\n"
+        "CLASS_A_UNRELATED,default_placement\n"
+    )
+    rerun_unrelated_csv = (
+        "Rule Name,Placement Name\n"
+        "CLASS_A_UNRELATED,default_placement\n"
+    )
+    client = FakeClient([record("rec1")])
+    llm = DispositionLLM([initial_csv, rerun_unrelated_csv])
+
+    # Run 1: generate RPC+PTP and Unrelated together.
+    pipeline.process_ticked_rows(
+        client,
+        llm,
+        selected_prompts=prompts.resolve_prompts(["rpc_ptp", "unrelated"]),
+    )
+    assert client.records["rec1"]["fields"][FIELD_OUTPUT] == [
+        {"file_token": "up1"},  # RIGHT_PARTY_CONTACT
+        {"file_token": "up2"},  # PTP
+        {"file_token": "up3"},  # UNRELATED
+    ]
+
+    # Re-tick and rerun only Unrelated: RPC and PTP tokens must remain, only Unrelated is replaced.
+    client.records["rec1"]["fields"][FIELD_PROCESS] = True
+    pipeline.process_ticked_rows(
+        client,
+        llm,
+        selected_prompts=prompts.resolve_prompts(["unrelated"]),
+    )
+    assert client.records["rec1"]["fields"][FIELD_OUTPUT] == [
+        {"file_token": "up1"},  # preserved RIGHT_PARTY_CONTACT
+        {"file_token": "up2"},  # preserved PTP
+        {"file_token": "up4"},  # newly uploaded UNRELATED
+    ]
+
+
+def test_rerunning_disposition_replaces_stale_named_file_without_touching_similar_suffixes():
+    import prompts
+
+    client = FakeClient([
+        record(
+            "rec1",
+            output=[
+                attachment("tok_rpc", "2026-02-01_rec1_OLD_SLUG_RIGHT_PARTY_CONTACT.csv", 10, "text/csv"),
+                attachment("tok_ptp", "2026-02-01_rec1_OLD_SLUG_PTP.csv", 10, "text/csv"),
+                attachment("tok_fu", "2026-02-01_rec1_OLD_SLUG_PTP_FOLLOW_UP.csv", 10, "text/csv"),
+            ],
+        )
+    ])
+    llm = RecordingLLM(
+        csv_text=(
+            "Rule Name,Placement Name\n"
+            "NEW_SLUG_RIGHT_PARTY_CONTACT,default_placement\n"
+            "NEW_SLUG_PTP,default_placement\n"
+        )
+    )
+    pipeline.process_ticked_rows(
+        client,
+        llm,
+        selected_prompts=prompts.resolve_prompts(["rpc_ptp"]),
+    )
+    assert client.records["rec1"]["fields"][FIELD_OUTPUT] == [
+        {"file_token": "tok_fu"},  # PTP_FOLLOW_UP is NOT treated as _PTP
+        {"file_token": "up1"},
+        {"file_token": "up2"},
+    ]
 
 
 def test_row_without_attachment_fails_without_calling_the_llm_or_uploading():

@@ -26,8 +26,10 @@ each request may land on a different instance.
 4. A run starts no new row once `RUN_BUDGET_SECONDS` (default 150) have passed. Rows it did not reach stay ticked, and the page says how many. Click **Run** again to continue.
 5. The **Status of all rows** page (`/status`) lists every processed row with its status and attached CSV(s), read from the grid.
 
-To process a row again, tick its box again. The new CSV(s) replace the ones in the row. If the re-run
-fails, the old CSV(s) stay in the row and the Status says `Failed`.
+To process a row again, tick its box again. Only the attachment(s) matching the re-run
+disposition(s) or filename are replaced in `Output CSV for NLU`; attachments from other
+dispositions remain in the cell. If the re-run fails, the previous CSV(s) stay in the row and the
+Status says `Failed`.
 
 ## The grid
 

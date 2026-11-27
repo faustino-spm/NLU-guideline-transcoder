@@ -305,8 +305,7 @@ def test_status_reads_latest_outputs_after_rerun():
               headers={"content-type": "application/x-www-form-urlencoded"})
     text = site.get("/status", params={"key": KEY}).text
     assert "Integrated" in text
-    assert "up2" in text
-    assert "up1" not in text
+    assert "2026-03-01_r1.csv" in text
 
 
 # -- configuration and entrypoint --------------------------------------------

@@ -67,7 +67,20 @@ class FakeClient:
         self.app_token = "APP"
 
     def list_records(self, **_: Any) -> list[dict[str, Any]]:
-        return [dict(r, fields=dict(r["fields"])) for r in self.records.values()]
+        result = []
+        for r in self.records.values():
+            fields = dict(r["fields"])
+            if isinstance(fields.get(FIELD_OUTPUT), list):
+                enriched = []
+                for item in fields[FIELD_OUTPUT]:
+                    if isinstance(item, dict) and "name" not in item and item.get("file_token") in self.uploads:
+                        name, content = self.uploads[item["file_token"]]
+                        enriched.append({**item, "name": name, "size": len(content), "type": "text/csv"})
+                    else:
+                        enriched.append(item)
+                fields[FIELD_OUTPUT] = enriched
+            result.append({**r, "fields": fields})
+        return result
 
     def update_record(self, record_id: str, fields: dict[str, Any]) -> dict[str, Any]:
         if record_id in self.fail_updates_for:

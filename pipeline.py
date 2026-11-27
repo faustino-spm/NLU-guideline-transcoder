@@ -254,6 +254,42 @@ def _fail(client: BaseClient, row: Row, exc: Exception,
     )
 
 
+def _replaced_suffixes(specs: Sequence[PromptSpec], slices: Sequence[CsvSlice]) -> tuple[str, ...]:
+    """Rule-name suffixes whose attachments are superseded by this run's sliced outputs."""
+    if not slices:
+        return ()
+    suffixes = {suffix for spec in specs for suffix in spec.rule_suffixes}
+    suffixes.update(s.rule_name for s in slices)
+    return tuple(suffixes)
+
+
+def _should_replace_output(
+    existing: Attachment,
+    new_names: set[str],
+    replaced_suffixes: tuple[str, ...],
+) -> bool:
+    if existing.name in new_names:
+        return True
+    lowered = existing.name.lower()
+    return any(lowered.endswith(f"_{suffix.lower()}.csv") for suffix in replaced_suffixes)
+
+
+def _merge_output_attachments(
+    existing_outputs: Sequence[Attachment],
+    new_uploads: Sequence[tuple[str, str]],
+    replaced_suffixes: tuple[str, ...],
+) -> list[dict[str, str]]:
+    """Preserve untouched attachments in `Output CSV for NLU` while replacing superseded ones."""
+    new_names = {fname for fname, _ in new_uploads}
+    kept = [
+        {"file_token": item.file_token}
+        for item in existing_outputs
+        if not _should_replace_output(item, new_names, replaced_suffixes)
+    ]
+    added = [{"file_token": token} for _, token in new_uploads]
+    return kept + added
+
+
 def _process_row(
     client: BaseClient,
     llm: LLM,
@@ -262,7 +298,9 @@ def _process_row(
 ) -> RowResult:
     """Download, run the LLM, attach the CSV(s) and mark the row Integrated. Any error marks it Failed.
 
-    A re-run that fails leaves the row's previous CSV(s) in place; the Status says Failed.
+    Re-running replaces only the matching disposition/filename attachments in `Output CSV for NLU`,
+    keeping attachments from other dispositions intact. A failed re-run leaves all previous CSVs in
+    place and sets Status to Failed.
     """
     specs = selected_prompts if selected_prompts is not None else resolve_prompts(None)
     prompt_ids = tuple(spec.id for spec in specs)
@@ -295,10 +333,18 @@ def _process_row(
             detail = f"{detail} · {len(slices)} disposition(s)"
         name = csv_file_name(row)
         to_upload = [(s.file_name, s.csv_text) for s in slices] if slices else [(name, csv_text)]
-        tokens = [client.upload_media(fname, text.encode("utf-8")) for fname, text in to_upload]
+        uploaded = [
+            (fname, client.upload_media(fname, text.encode("utf-8")))
+            for fname, text in to_upload
+        ]
+        merged_outputs = _merge_output_attachments(
+            row.outputs,
+            uploaded,
+            _replaced_suffixes(specs, slices),
+        )
         client.update_record(row.record_id, {
             FIELD_STATUS: STATUS_INTEGRATED,
-            FIELD_OUTPUT: [{"file_token": token} for token in tokens],
+            FIELD_OUTPUT: merged_outputs,
         })
         return RowResult(
             row.record_id,
