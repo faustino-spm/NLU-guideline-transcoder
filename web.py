@@ -10,11 +10,12 @@ Configuration: everything lark_base.py and llm.py need, plus
 Pages (all need ?key=<RUN_KEY>):
     GET  /run      lists the ticked rows and shows a Run button. Changes nothing, so link
                    previews and double clicks are harmless.
-    POST /run      processes ticked rows inside this request and streams each row's result and
-                   downloadable CSV as it finishes.
-    GET  /status   output table of rows processed in this server instance, with downloadable CSVs.
+    POST /run      processes ticked rows inside this request, attaches CSVs in Lark, and streams
+                   each row's result and downloadable CSV as it finishes. Rows not reached before
+                   the budget ends stay ticked for the next click.
+    GET  /status   every row that has been processed, read from the grid.
 
-Nothing is written back to Lark.
+Nothing is kept in memory between requests: the grid's Status and Output columns are the state.
 """
 
 from __future__ import annotations
@@ -33,11 +34,12 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from lark_base import BaseClient, ConfigError, LarkApiError, client_from_env, load_dotenv
 from llm import LLM, llm_from_env
 from pipeline import (
-    STATUS_DONE,
     STATUS_FAILED,
-    CsvSlice,
+    STATUS_INTEGRATED,
+    STATUS_NOT_PROCESSED,
     Row,
     RowResult,
+    all_rows,
     describe,
     run_ticked_rows,
     ticked_rows,
@@ -77,7 +79,7 @@ def _page(title: str, body: str) -> str:
 
 
 def _status_cell(status: str) -> str:
-    css = "failed" if status == STATUS_FAILED else "ok" if status == STATUS_DONE else ""
+    css = "failed" if status == STATUS_FAILED else "ok" if status == STATUS_INTEGRATED else ""
     return f'<td class="{css}">{html.escape(status)}</td>'
 
 
@@ -98,7 +100,7 @@ def _csv_download_block(file_name: str, csv_text: str, link_label: str | None = 
 
 
 def _csv_cell(result: RowResult) -> str:
-    if result.status != STATUS_DONE or not result.file_name or result.csv_text is None:
+    if result.status != STATUS_INTEGRATED or not result.file_name or result.csv_text is None:
         return "<td></td>"
     if result.slices:
         parts = [
@@ -152,17 +154,15 @@ def _rows_table(rows: list[Row]) -> str:
     return f"<table><tr><th>Rows that will be processed</th></tr>{items}</table>"
 
 
-def _processed_table(results: list[RowResult]) -> str:
+def _processed_table(rows: list[Row]) -> str:
     body = "".join(
-        f"<tr><td>{html.escape(result.record_id)}</td>"
-        f"<td>{html.escape(result.date.isoformat() if result.date else '')}</td>"
-        f"<td>{html.escape(result.sub_campaign)}</td>"
-        f"<td>{html.escape(_prompt_labels(result.prompt_ids))}</td>"
-        f"{_status_cell(result.status)}"
-        f"<td>{html.escape(result.detail)}</td>{_csv_cell(result)}</tr>"
-        for result in results)
-    return ("<table><tr><th>Row</th><th>Date</th><th>Sub-campaign</th><th>Dispositions</th><th>Status</th>"
-            f"<th>Detail</th><th>CSV file</th></tr>{body}</table>")
+        f"<tr><td>{html.escape(row.record_id)}</td>"
+        f"<td>{html.escape(row.date.isoformat() if row.date else '')}</td>"
+        f"<td>{html.escape(row.sub_campaign)}</td>{_status_cell(row.status)}"
+        f"<td>{html.escape(', '.join(a.name for a in row.outputs))}</td></tr>"
+        for row in rows)
+    return ("<table><tr><th>Row</th><th>Date</th><th>Sub-campaign</th><th>Status</th><th>CSV file</th></tr>"
+            f"{body}</table>")
 
 
 def _grid_error(exc: Exception) -> HTMLResponse:
@@ -179,11 +179,9 @@ def create_app(client: BaseClient, llm: LLM, run_key: str,
         raise ConfigError("RUN_KEY is required: the trigger link must not be open to everyone.")
     # No /docs or /openapi.json: the service is reachable from the internet.
     app = FastAPI(title="Row processor", docs_url=None, redoc_url=None, openapi_url=None)
-    # Stops two concurrent runs in the same process (e.g. a double click).
+    # Stops two runs in the same process (e.g. a double click). Runs on different instances are
+    # kept apart only by the claim step: a claimed row is no longer ticked.
     busy = threading.Lock()
-    # Retains the latest output per (record_id, prompt_ids) for the /status output table.
-    history_lock = threading.Lock()
-    history: dict[tuple[str, tuple[str, ...]], RowResult] = {}
 
     def check_key(key: str) -> None:
         if not secrets.compare_digest(key.encode(), run_key.encode()):
@@ -208,24 +206,21 @@ def create_app(client: BaseClient, llm: LLM, run_key: str,
             try:
                 for result in run_ticked_rows(client, llm, budget_seconds, selected_prompts=selected):
                     results.append(result)
-                    history_key = (result.record_id, result.prompt_ids)
-                    with history_lock:
-                        history.pop(history_key, None)
-                        history[history_key] = result
                     yield _result_row(result)
                 yield "</table>"
-                left = max(0, len(ticked_rows(client)) - len(results))
+                left = len(ticked_rows(client))
             except Exception as exc:  # the run as a whole failed, e.g. the grid could not be read
                 reason = html.escape(f"{type(exc).__name__}: {exc}")
                 yield f'</table><p class="failed">Run failed: {reason}</p>'
                 left = 0
             failed = sum(1 for r in results if r.status == STATUS_FAILED)
             if results:
-                yield f"<p>Done: {len(results) - failed} succeeded, {failed} failed.</p>"
+                yield f"<p>Done: {len(results) - failed} integrated, {failed} failed.</p>"
             else:
                 yield "<p>No rows were ticked.</p>"
             if left:
-                yield (f"<p>{left} ticked row(s) were not reached before the time budget ended.</p>")
+                yield (f"<p>{left} row(s) are still ticked: the time budget ran out before they were "
+                       "reached, or they could not be claimed. Open the run page and click Run again.</p>")
             yield links(key) + FOOT
         finally:
             busy.release()
@@ -274,12 +269,16 @@ def create_app(client: BaseClient, llm: LLM, run_key: str,
     @app.get("/status", response_class=HTMLResponse)
     def status(key: str = "") -> HTMLResponse:
         check_key(key)
-        with history_lock:
-            rows = list(history.values())
+        try:
+            rows = [r for r in all_rows(client) if r.status not in ("", STATUS_NOT_PROCESSED)]
+        except (LarkApiError, httpx.HTTPError) as exc:
+            return _grid_error(exc)
         if not rows:
             body = "<p>No row has been processed yet.</p>"
         else:
-            body = _processed_table(rows)
+            body = (_processed_table(rows)
+                    + "<p>A row stuck in Queued was cut off before it finished; tick it again. "
+                    "The reason a row Failed is shown on the page of the run that processed it.</p>")
         return HTMLResponse(_page("Processed rows", body + links(key)))
 
     return app

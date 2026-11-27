@@ -7,8 +7,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 import web
-from fakes import FakeClient, record
-from lark_base import ConfigError, LarkApiError
+from fakes import FakeClient, attachment, record
+from lark_base import FIELD_OUTPUT, FIELD_PROCESS, FIELD_STATUS, ConfigError, LarkApiError
 from llm import StubLLM
 
 KEY = "s3cret"
@@ -59,7 +59,7 @@ def test_every_page_needs_the_key(method, path, params):
     site, client, llm = make([record("r1")])
     response = getattr(site, method)(path, params=params, follow_redirects=False)
     assert response.status_code == 403
-    assert client.downloads == [] and llm.calls == 0
+    assert client.updates == [] and client.downloads == [] and llm.calls == 0
 
 
 def test_the_app_refuses_to_start_without_a_run_key():
@@ -84,7 +84,7 @@ def test_get_run_lists_ticked_rows_and_changes_nothing():
     assert "r1" in response.text and "r3" in response.text and "r2" not in response.text
     assert "Run 2 row(s)" in response.text
     assert 'method="post"' in response.text
-    assert client.downloads == [] and llm.calls == 0  # a link preview or double click starts nothing
+    assert client.updates == [] and client.downloads == [] and llm.calls == 0  # a link preview or double click starts nothing
 
 
 def test_get_run_with_nothing_ticked_has_no_run_button():
@@ -129,13 +129,17 @@ def test_post_run_processes_ticked_rows_and_embeds_downloadable_csv():
     assert response.headers["content-type"].startswith("text/html")
     assert llm.calls == 1
     assert client.downloads == ["tok-r1"]
+    assert client.records["r1"]["fields"][FIELD_STATUS] == "Integrated"
+    assert client.records["r1"]["fields"][FIELD_PROCESS] is False
+    assert client.records["r1"]["fields"][FIELD_OUTPUT] == [{"file_token": "up1"}]
+    assert client.records["r2"]["fields"][FIELD_STATUS] == "Not Processed"
     assert "2026-03-01_r1.csv" in response.text
     assert "data:text/csv;charset=utf-8," in response.text
     uri = response.text.split('href="data:text/csv;charset=utf-8,', 1)[1].split('"', 1)[0]
     assert unquote(uri) == "col1,col2\n<v>,2\n"
     assert "&lt;v&gt;,2" in response.text
-    assert "Done: 1 succeeded, 0 failed." in response.text
-    assert "not reached" not in response.text
+    assert "Done: 1 integrated, 0 failed." in response.text
+    assert "still ticked" not in response.text
     assert response.text.rstrip().endswith("</html>")
 
 
@@ -143,21 +147,23 @@ def test_post_run_with_nothing_ticked_says_so():
     site, client, llm = make([record("r1", ticked=False)])
     text = site.post("/run", params={"key": KEY}).text
     assert "No rows were ticked." in text
-    assert client.downloads == [] and llm.calls == 0
+    assert client.updates == [] and client.downloads == [] and llm.calls == 0
 
 
-def test_rows_not_reached_before_the_budget_ends_are_reported():
-    site, _, llm = make([record("r1"), record("r2")], budget_seconds=0)
+def test_rows_not_reached_before_the_budget_ends_stay_ticked_and_are_reported():
+    site, client, llm = make([record("r1"), record("r2")], budget_seconds=0)
     text = site.post("/run", params={"key": KEY}).text
     assert llm.calls == 0
-    assert "2 ticked row(s) were not reached" in text
+    assert "2 row(s) are still ticked" in text
+    assert client.records["r1"]["fields"][FIELD_PROCESS] is True
 
 
 def test_a_failed_row_is_shown_with_its_reason_and_counted():
-    site, _, _ = make([record("r1", attachments=None), record("r2")])
+    site, client, _ = make([record("r1", attachments=None), record("r2")])
     text = site.post("/run", params={"key": KEY}).text
     assert "no attachment" in text
-    assert "Done: 1 succeeded, 1 failed." in text
+    assert "Done: 1 integrated, 1 failed." in text
+    assert client.records["r1"]["fields"][FIELD_STATUS] == "Failed"
 
 
 def test_a_run_that_cannot_read_the_grid_says_so_and_releases_the_lock():
@@ -170,7 +176,7 @@ def test_a_run_that_cannot_read_the_grid_says_so_and_releases_the_lock():
 
 def test_a_second_run_in_the_same_process_is_refused_while_one_is_going():
     llm = BlockingLLM()
-    site, _, _ = make([record("r1")], llm=llm)
+    site, client, _ = make([record("r1")], llm=llm)
     other = TestClient(site.app)
     first = {}
     runner = threading.Thread(target=lambda: first.update(text=site.post("/run", params={"key": KEY}).text))
@@ -184,29 +190,51 @@ def test_a_second_run_in_the_same_process_is_refused_while_one_is_going():
         runner.join(10)
 
     assert llm.calls == 1
-    assert "Done: 1 succeeded, 0 failed." in first["text"]
+    assert "Done: 1 integrated, 0 failed." in first["text"]
     # once finished, a new run can start again
-    assert "Done: 1 succeeded" in site.post("/run", params={"key": KEY}).text
+    client.records["r1"]["fields"][FIELD_PROCESS] = True
+    assert "Done: 1 integrated" in site.post("/run", params={"key": KEY}).text
 
 
 # -- status page -------------------------------------------------------------
 
 
+def test_status_lists_processed_rows_from_the_grid():
+    site, *_ = make([
+        record("r1", ticked=False, status="Integrated", output=[attachment("t", "2026-03-01_r1.csv")]),
+        record("r2", ticked=False, status="Failed"),
+        record("r3", ticked=False, status="Queued"),
+        record("r4", ticked=False, status="Not Processed"),
+        record("r5", ticked=False, status=None),
+    ])
+    text = site.get("/status", params={"key": KEY}).text
+    assert "r1" in text and "Integrated" in text and "2026-03-01_r1.csv" in text
+    assert "r2" in text and "Failed" in text
+    assert "r3" in text and "Queued" in text
+    assert "r4" not in text and "r5" not in text
+
+
+def test_status_needs_no_memory_of_an_earlier_request():
+    site, client, _ = make([record("r1")])
+    site.post("/run", params={"key": KEY})
+    fresh = TestClient(web.create_app(client, CountingLLM(), KEY))  # a different instance
+    assert "Integrated" in fresh.get("/status", params={"key": KEY}).text
+
+
 def test_status_with_nothing_processed():
-    site, *_ = make([record("r1")])
+    site, *_ = make([record("r1", status="Not Processed")])
     assert "No row has been processed yet." in site.get("/status", params={"key": KEY}).text
 
 
-def test_status_retains_processed_rows_and_csv_downloads():
-    site, *_ = make([record("r1", sub_campaign="<b>x</b>"), record("r2", attachments=None)],
-                    llm=CountingLLM("a,b\n1,2\n"))
-    site.post("/run", params={"key": KEY})
+def test_status_escapes_row_data():
+    site, *_ = make([record("r1", ticked=False, status="Integrated", sub_campaign="<b>x</b>")])
     text = site.get("/status", params={"key": KEY}).text
-    assert "r1" in text and "2026-03-01" in text and "&lt;b&gt;x&lt;/b&gt;" in text
-    assert "<b>x</b>" not in text
-    assert "2026-03-01_r1.csv" in text
-    assert "data:text/csv;charset=utf-8," in text
-    assert "r2" in text and "Failed" in text and "no attachment" in text
+    assert "<b>x</b>" not in text and "&lt;b&gt;" in text
+
+
+def test_status_with_an_unreadable_grid_gives_502():
+    site, *_ = make([], client=DownClient([]))
+    assert site.get("/status", params={"key": KEY}).status_code == 502
 
 
 # -- multi-disposition prompt selector and CSV slicing -----------------------
@@ -249,7 +277,7 @@ def test_post_run_uses_selected_form_prompts_and_renders_sliced_downloads():
                 "CLASS_A_UNRELATED,default_placement\n"
             )
 
-    site, *_ = make([record("r1")], llm=CapturingLLM())
+    site, client, *_ = make([record("r1")], llm=CapturingLLM())
     response = site.post(
         "/run",
         params={"key": KEY},
@@ -262,17 +290,23 @@ def test_post_run_uses_selected_form_prompts_and_renders_sliced_downloads():
     assert "Download CLASS_A_CLAIMING_PAID.csv" in response.text
     assert "Download CLASS_A_UNRELATED.csv" in response.text
     assert "Download All (2026-03-01_r1.csv)" in response.text
+    assert client.records["r1"]["fields"][FIELD_OUTPUT] == [
+        {"file_token": "up1"},
+        {"file_token": "up2"},
+    ]
 
 
-def test_status_preserves_separate_runs_for_different_disposition_sets():
-    site, *_ = make([record("r1")], llm=CountingLLM("a,b\n1,2\n"))
+def test_status_reads_latest_outputs_after_rerun():
+    site, client, _ = make([record("r1")], llm=CountingLLM("a,b\n1,2\n"))
     site.post("/run", params={"key": KEY}, content="prompt=rpc_ptp",
               headers={"content-type": "application/x-www-form-urlencoded"})
+    client.records["r1"]["fields"][FIELD_PROCESS] = True
     site.post("/run", params={"key": KEY}, content="prompt=claiming_paid",
               headers={"content-type": "application/x-www-form-urlencoded"})
     text = site.get("/status", params={"key": KEY}).text
-    assert "RPC + PTP (1:1 Baseline)" in text
-    assert "Claiming Paid / Fully Paid" in text
+    assert "Integrated" in text
+    assert "up2" in text
+    assert "up1" not in text
 
 
 # -- configuration and entrypoint --------------------------------------------
