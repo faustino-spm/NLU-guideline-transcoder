@@ -22,6 +22,7 @@ from typing import Callable, Protocol
 import httpx
 
 from lark_base import ConfigError, load_dotenv
+from prompts import validate_prompts_exist
 
 log = logging.getLogger("llm")
 
@@ -59,7 +60,14 @@ RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 
 class LLM(Protocol):
-    def generate_csv(self, row_date: date | None, sub_campaign: str, files: list[Path]) -> str:
+    def generate_csv(
+        self,
+        row_date: date | None,
+        sub_campaign: str,
+        files: list[Path],
+        *,
+        prompt_text: str | None = None,
+    ) -> str:
         """Return the CSV text for one row. `files` are the row's downloaded attachments."""
         ...
 
@@ -67,7 +75,14 @@ class LLM(Protocol):
 class StubLLM:
     """Returns a fixed-shape CSV describing its inputs, so the whole round trip can be checked."""
 
-    def generate_csv(self, row_date: date | None, sub_campaign: str, files: list[Path]) -> str:
+    def generate_csv(
+        self,
+        row_date: date | None,
+        sub_campaign: str,
+        files: list[Path],
+        *,
+        prompt_text: str | None = None,
+    ) -> str:
         buffer = io.StringIO()
         writer = csv.writer(buffer, lineterminator="\n")
         writer.writerow(["data_collection_date", "sub_campaign", "attachment_count", "attachment_names"])
@@ -430,8 +445,15 @@ class NanoGPTLLM:
         self._http = httpx.Client(timeout=timeout, transport=transport,
                                   headers={"Authorization": f"Bearer {api_key}"})
 
-    def generate_csv(self, row_date: date | None, sub_campaign: str, files: list[Path]) -> str:
-        body = self._request_body(row_date, sub_campaign, files)
+    def generate_csv(
+        self,
+        row_date: date | None,
+        sub_campaign: str,
+        files: list[Path],
+        *,
+        prompt_text: str | None = None,
+    ) -> str:
+        body = self._request_body(row_date, sub_campaign, files, prompt_text=prompt_text)
         last_error: LLMError | None = None
         for attempt in (1, 2):
             reply = self._call(body)
@@ -444,13 +466,25 @@ class NanoGPTLLM:
                 log.warning("attempt %d: unusable CSV from %s: %s", attempt, self.model, exc)
         raise LLMError(f"no usable CSV after 2 attempts: {last_error}")
 
-    def _request_body(self, row_date: date | None, sub_campaign: str, files: list[Path]) -> dict:
-        prompt = self.prompt_file.read_text(encoding="utf-8-sig").strip()
-        if not prompt:
-            raise LLMError(f"{self.prompt_file.name} is empty")
-        # The row's values reach the model only where the prompt asks for them.
-        prompt = (prompt.replace("{date}", row_date.isoformat() if row_date else "unknown")
-                  .replace("{sub_campaign}", sub_campaign or "unknown"))
+    def _request_body(
+        self,
+        row_date: date | None,
+        sub_campaign: str,
+        files: list[Path],
+        *,
+        prompt_text: str | None = None,
+    ) -> dict:
+        if prompt_text is not None:
+            prompt = prompt_text.strip()
+            if not prompt:
+                raise LLMError("prompt is empty")
+        else:
+            prompt = self.prompt_file.read_text(encoding="utf-8-sig").strip()
+            if not prompt:
+                raise LLMError(f"{self.prompt_file.name} is empty")
+            # The row's values reach the model only where the prompt asks for them.
+            prompt = (prompt.replace("{date}", row_date.isoformat() if row_date else "unknown")
+                      .replace("{sub_campaign}", sub_campaign or "unknown"))
         parts: list[dict] = []
         for path in files:
             parts.extend(_attachment_parts(path))
@@ -528,4 +562,5 @@ def llm_from_env() -> LLM:
         raise ConfigError("NANOGPT_API_KEY is not set (set LLM=stub to run without NanoGPT)")
     if not DEFAULT_PROMPT_FILE.is_file():
         raise ConfigError(f"{DEFAULT_PROMPT_FILE.name} is missing")
+    validate_prompts_exist()
     return NanoGPTLLM(api_key, NANOGPT_MODEL)

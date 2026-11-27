@@ -1,0 +1,12 @@
+### Disposition Block: Third-Party Contact (`<SLUG>_THIRD_PARTY_CONTACT`)
+Generate **ONE** disposition: `<SLUG>_THIRD_PARTY_CONTACT` (Call answered by a third party such as a relative, colleague, or authorized representative rather than the borrower).
+
+**Consistent Deviations From RPC / PTP Baseline:**
+- **Preserve From Client Rubric:** Opening Greeting (`opening_greeting_intent`), Agent Name (`agents_name_intent`), Company Name (`company_name_intent`), Call Recording Disclosure (`recording_disclosure_intent`, `auto_fail`), Professionalism & Courtesy, Documentation (`auto_pass`), all Compliance / ZTP gates — **especially Data Privacy Act / Unauthorized Third-Party Disclosure (`data_privacy_act_compliance_intent` with `auto_fail,negate`)**, Courteous Closing (`closing_courteous_intent`), and the 3-row `Risk Level` block.
+- **Strip / Omit All Borrower-Specific RPC & PTP Rows:** Do NOT include borrower Positive ID (`pid_*`, `birthdate_verification_intent`, `declared_address_verification_intent`), account status / balance / OB disclosure, RFD, SOI, urgency/consequences, negotiation hierarchy (`priority1`–`priority4`), PTP capture, or PTP recap. (Never require disclosing debt details to a third party.)
+- **Activate / Inject Third-Party Contact (3PC) Checks** (activating any 3PC section explicitly printed on the client form or carried in Stage 1 as `not_applicable`, and ensuring these canonical checks are active):
+  1. **Third-Party Identification & Relationship:** `callee_identification_intent` and `tpc_third_party_identification_intent` (identifying the third party's name and relationship to the borrower).
+  2. **Probe Borrower Availability / Best Time to Call:** `probed_btc_intent` and `probed_eta_intent` (asking when the borrower will be available / best time to call back).
+  3. **Verify / Request Alternative Contact Number:** `alternative_contact_number_intent` (asking for an updated or alternative contact number to reach the borrower directly).
+  4. **Non-Disclosing Callback / Message Relay:** `tpc_leave_callback_message_intent` (leaving a polite callback message and contact number without disclosing any confidential debt or account details).
+- **Scoring:** Re-normalize active core `Component Score` values so unique active core `(Component, Checklist Name)` pairs on `<SLUG>_THIRD_PARTY_CONTACT` sum to **`100`** (rounded to 2 decimal places). Keep 0-pt ZTP/Compliance gates and `Risk Level` empty (`""`).

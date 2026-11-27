@@ -1,0 +1,10 @@
+### Disposition Block: Unrelated Party (`<SLUG>_UNRELATED`)
+Generate **ONE** disposition: `<SLUG>_UNRELATED` (Call reached an unrelated party / wrong number with no relation to the borrower).
+
+**Consistent Deviations From RPC / PTP Baseline:**
+- **Most Stripped-Down Disposition — Preserve Only:** Opening Greeting (`opening_greeting_intent`), Agent Name (`agents_name_intent`), Company Name (`company_name_intent`), Call Recording Disclosure (`recording_disclosure_intent`, `auto_fail`), Professionalism & Data Privacy Compliance (`professionalism_compliance_intent` and `data_privacy_act_compliance_intent`, `auto_fail,negate`), Documentation / System Tagging (`conversation_documentation_accuracy_intent`, `auto_pass`), Courteous Closing (`closing_courteous_intent`), and the 3-row `Risk Level` block.
+- **Strip / Omit Completely:** Remove ALL borrower Positive ID (`pid_*`), account status / balance / OB, RFD, SOI, urgency/consequences, negotiation hierarchy, PTP capture/recap, and 3PC message-relay / callback-schedule probing rows.
+- **Inject Unrelated-Party Handling Checks** (placed under the client's Opening or Call Proper `Component`):
+  1. **Callee Identification / Wrong-Number Confirmation:** `callee_identification_intent` (confirming the callee's name and verifying they are not the borrower and have no relation to the borrower).
+  2. **Apologize & Advise to Disregard Call:** `disregard_call_intent` (politely apologizing for the inconvenience and advising the callee to disregard the call without disclosing any confidential account details).
+- **Scoring:** Re-normalize active core `Component Score` values so unique active core `(Component, Checklist Name)` pairs on `<SLUG>_UNRELATED` sum to **`100`** (rounded to 2 decimal places). Keep 0-pt ZTP/Compliance gates and `Risk Level` empty (`""`).

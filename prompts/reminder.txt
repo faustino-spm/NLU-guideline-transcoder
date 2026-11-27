@@ -1,0 +1,12 @@
+### Disposition Block: PTP / Payment Reminder (`<SLUG>_PTP_REMINDER`)
+Generate **ONE** disposition: `<SLUG>_PTP_REMINDER` (Courtesy reminder call for an upcoming Promise to Pay or payment due date).
+
+**Consistent Deviations From RPC / PTP Baseline:**
+- **Preserve From Client Rubric:** Opening (greeting, agent/company name, recording disclosure `auto_fail`), Positive Identification / Account Verification (`auto_fail`), Soft Skills / Courtesy / Active Listening (`active_listening_intent` `client` `negate`) / Call Quality, Documentation (`auto_pass`), all Compliance / ZTP gates (`auto_fail` / `auto_fail,negate`), Closing, and the 3-row `Risk Level` block.
+- **Prune:** Remove delinquency probing (`reason_for_delinquency_intent`, `source_of_income_intent`), hard objection handling / consequences escalation, full `priority1`–`priority4` negotiation hierarchy, broken-promise probing, and any 3PC-only rows.
+- **Inject / Swap In Reminder Checks** (placed under the client's main Call Proper / Collection Skills `Component`):
+  1. **Payment Due Date Reminder:** `reminder_payment_due_date_intent` (reminding the customer of the agreed PTP / payment due date).
+  2. **Amount Due Reminder:** `reminder_amount_due_intent` (confirming the exact promised or due payment amount).
+  3. **Payment Channel & Posting Reminder:** `payment_channel_intent` and `payment_posting_intent` (confirming preferred payment channel/mode of payment and reminding about posting/cut-off times).
+  4. **Payment Readiness Confirmation:** `reminder_payment_readiness_confirmation_intent` (confirming the customer is on track to pay as scheduled and asking if they need assistance).
+- **Scoring:** Re-normalize active core `Component Score` values so unique active core `(Component, Checklist Name)` pairs on `<SLUG>_PTP_REMINDER` sum to **`100`** (rounded to 2 decimal places). Keep 0-pt ZTP/Compliance gates and `Risk Level` empty (`""`).

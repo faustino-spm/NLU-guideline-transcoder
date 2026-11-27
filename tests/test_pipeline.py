@@ -239,3 +239,90 @@ def test_downloaded_files_are_cleaned_up_after_each_row():
 
     run(FakeClient([record("r1")]), SpyLLM())
     assert seen and not any(path.exists() for path in seen)
+
+
+# -- multi-disposition chaining, merging, and CSV slicing --------------------
+
+
+def test_slice_csv_by_rule_name_splits_each_disposition_with_header():
+    row = pipeline.parse_row(record("r1"))
+    csv_text = (
+        "Rule Name,Placement Name,Intent\n"
+        "TALA_EDC_RIGHT_PARTY_CONTACT,default_placement,opening_greeting_intent\n"
+        "TALA_EDC_PTP,default_placement,ptp_payment_amount_confirmation_intent\n"
+        "TALA_EDC_PTP,default_placement,summarize_amount_intent\n"
+    )
+    slices = pipeline.slice_csv_by_rule_name(row, csv_text)
+    assert [s.rule_name for s in slices] == ["TALA_EDC_RIGHT_PARTY_CONTACT", "TALA_EDC_PTP"]
+    assert slices[0].file_name == "2026-03-01_r1_TALA_EDC_RIGHT_PARTY_CONTACT.csv"
+    assert slices[0].csv_text.splitlines() == [
+        "Rule Name,Placement Name,Intent",
+        "TALA_EDC_RIGHT_PARTY_CONTACT,default_placement,opening_greeting_intent",
+    ]
+    assert len(slices[1].csv_text.splitlines()) == 3
+
+
+def test_merge_csvs_rejects_mismatched_headers():
+    with pytest.raises(ValueError, match="headers do not match"):
+        pipeline.merge_csvs(["a,b\n1,2\n", "a,c\n3,4\n"])
+
+
+def test_chained_execution_runs_call2_on_call1_csv_without_files():
+    import prompts
+
+    calls = []
+
+    class PromptAwareLLM:
+        def generate_csv(self, row_date, sub_campaign, files, *, prompt_text=None):
+            calls.append(([f.name for f in files], prompt_text))
+            if len(calls) == 1:
+                return (
+                    "Rule Name,Placement Name\n"
+                    "CLASS_A_RIGHT_PARTY_CONTACT,default_placement\n"
+                    "CLASS_A_PTP,default_placement\n"
+                )
+            return (
+                "Rule Name,Placement Name\n"
+                "CLASS_A_PTP_FOLLOW_UP,default_placement\n"
+                "CLASS_A_CLAIMING_PAID,default_placement\n"
+                "CLASS_A_UNRELATED,default_placement\n"
+            )
+
+    selected = prompts.resolve_prompts(["rpc_ptp", "follow_up", "claiming_paid", "unrelated"])
+    report = pipeline.process_ticked_rows(FakeClient([record("r1")]), PromptAwareLLM(), selected_prompts=selected)
+
+    assert len(calls) == 2
+    assert calls[0][0] == ["1_r1.pdf"]
+    assert "CLASS_A_PTP" not in calls[0][1]
+    assert calls[1][0] == []  # Call 2 does not re-upload attachments
+    assert "CLASS_A_PTP,default_placement" in calls[1][1]  # Call 2 is anchored to Call 1 CSV
+    result = report.results[0]
+    assert result.status == "Done"
+    assert "chained 2 calls" in result.detail
+    assert [s.rule_name for s in result.slices] == [
+        "CLASS_A_RIGHT_PARTY_CONTACT",
+        "CLASS_A_PTP",
+        "CLASS_A_PTP_FOLLOW_UP",
+        "CLASS_A_CLAIMING_PAID",
+        "CLASS_A_UNRELATED",
+    ]
+
+
+def test_cmd_run_writes_combined_and_sliced_csvs(tmp_path):
+    csv_text = (
+        "Rule Name,Placement Name\n"
+        "A_RIGHT_PARTY_CONTACT,default_placement\n"
+        "A_PTP,default_placement\n"
+    )
+    code = pipeline.cmd_run(FakeClient([record("r1")]), RecordingLLM(csv_text=csv_text), output_dir=tmp_path)
+    assert code == 0
+    assert (tmp_path / "2026-03-01_r1.csv").is_file()
+    assert (tmp_path / "2026-03-01_r1_A_RIGHT_PARTY_CONTACT.csv").is_file()
+    assert (tmp_path / "2026-03-01_r1_A_PTP.csv").is_file()
+
+
+def test_cli_list_prompts_prints_all_blocks(capsys):
+    assert pipeline.main(["--list-prompts"]) == 0
+    out = capsys.readouterr().out
+    for pid in ("rpc_ptp", "follow_up", "reminder", "claiming_paid", "third_party_contact", "unrelated"):
+        assert pid in out

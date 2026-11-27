@@ -1,0 +1,19 @@
+### Disposition Block: RPC + PTP (`<SLUG>_RIGHT_PARTY_CONTACT` and `<SLUG>_PTP`)
+Generate **TWO** dispositions in this exact order:
+1. `<SLUG>_RIGHT_PARTY_CONTACT` (Right Party Contact without a finalized Promise to Pay)
+2. `<SLUG>_PTP` (Right Party Contact with a Promise to Pay)
+
+**Rules & Deviations:**
+- **Full 1:1 Client-Rubric Mirror:** Include every scored criterion, every Zero Tolerance Policy (ZTP) / Compliance policy item, and any 3rd-Party Contact (3PC) section if explicitly printed on the form (marking 3PC items as `not_applicable` in both dispositions with empty `Component Score`).
+- **Scoring:**
+  - If the attachment specifies explicit criterion/pillar weights or percentages: preserve those exact template weights (rounding fractional splits to 2 decimal places, e.g., `6.67`, `4.44`, `3.75`, `2.5`, `1.88`) so the sum of all core rubric checklists equals `100` (within ±0.2). Do NOT distort or rescale explicit client weights just because an individual checklist is marked `not_applicable` on one disposition.
+  - If the attachment has no percentage/point weights (e.g., Yes/No/N/A forms or defect-deduction sheets): distribute points across the active RPC/PTP checklists (proportionally by defect severity if Critical/Important/Essential tiers are given, or evenly across active checklists if unweighted) so unique active core checklists on `_PTP` sum to `100` (rounded to 2 decimals).
+- **Negotiation & PTP Decomposition:**
+  - Whenever a checklist covers **hierarchy of negotiation** OR **offering appropriate payment options / alternative solutions / arrangements**, expand into tiered priority intents (`priority1`..`priority4`, e.g., `one_time_payment_intent`, `split_amount_intent` / `discounted_offer_intent`, `installment_intent`, `perennial_partial_intent` / `partial_payment_intent`).
+  - Split PTP capture into `ptp_payment_amount_confirmation_intent`, `ptp_payment_date_confirmation_intent`, `ptp_payment_mode_of_payment_confirmation_intent`.
+  - Split PTP/offer recap into `summarize_amount_intent`, `summarize_date_intent`, `summarize_mode_of_payment_intent`.
+- **RPC vs. PTP Parity & Gating:**
+  - Both `<SLUG>_RIGHT_PARTY_CONTACT` and `<SLUG>_PTP` MUST share the exact same rubric structure, `Component`, `Checklist Name`, `Intent`, and `Component Score` values.
+  - The ONLY difference between `_RIGHT_PARTY_CONTACT` and `_PTP` is toggling `Special Condition`:
+    - On `_RIGHT_PARTY_CONTACT` ONLY: set `not_applicable` on PTP-specific rows (securing/obtaining PTP, PTP amount/date/MOP confirmation, PTP recap/summarization, PTP next steps, payment confirmation / next due date reminder, payment channel/posting if tied to PTP). On `_PTP`, those exact same rows MUST be active (`""`).
+    - On `_PTP` ONLY: set `not_applicable` on any item explicitly worded as "expectations when there is NO PTP arrangement" (active on `_RIGHT_PARTY_CONTACT`). Keep probing for RFD and Source of Income active on BOTH dispositions.

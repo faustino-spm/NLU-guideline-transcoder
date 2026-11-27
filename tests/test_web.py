@@ -209,6 +209,72 @@ def test_status_retains_processed_rows_and_csv_downloads():
     assert "r2" in text and "Failed" in text and "no attachment" in text
 
 
+# -- multi-disposition prompt selector and CSV slicing -----------------------
+
+
+def test_get_run_renders_disposition_checkboxes_with_rpc_ptp_default():
+    site, *_ = make([record("r1")])
+    text = site.get("/run", params={"key": KEY}).text
+    assert 'type="checkbox" name="prompt" value="rpc_ptp" checked' in text
+    assert 'type="checkbox" name="prompt" value="claiming_paid">' in text
+    assert 'type="checkbox" name="prompt" value="unrelated">' in text
+
+
+def test_get_run_preselects_prompts_from_query_string():
+    site, *_ = make([record("r1")])
+    text = site.get("/run", params={"key": KEY, "prompt": "claiming_paid,unrelated"}).text
+    assert 'type="checkbox" name="prompt" value="rpc_ptp">' in text
+    assert 'type="checkbox" name="prompt" value="claiming_paid" checked' in text
+    assert 'type="checkbox" name="prompt" value="unrelated" checked' in text
+
+
+@pytest.mark.parametrize("method", ["get", "post"])
+def test_unknown_prompt_returns_400(method):
+    site, client, llm = make([record("r1")])
+    response = getattr(site, method)("/run", params={"key": KEY, "prompt": "does_not_exist"})
+    assert response.status_code == 400
+    assert "Unknown prompt" in response.text
+    assert client.downloads == [] and llm.calls == 0
+
+
+def test_post_run_uses_selected_form_prompts_and_renders_sliced_downloads():
+    captured = []
+
+    class CapturingLLM:
+        def generate_csv(self, row_date, sub_campaign, files, *, prompt_text=None):
+            captured.append(prompt_text)
+            return (
+                "Rule Name,Placement Name\n"
+                "CLASS_A_CLAIMING_PAID,default_placement\n"
+                "CLASS_A_UNRELATED,default_placement\n"
+            )
+
+    site, *_ = make([record("r1")], llm=CapturingLLM())
+    response = site.post(
+        "/run",
+        params={"key": KEY},
+        content="prompt=claiming_paid&prompt=unrelated",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+    assert response.status_code == 200
+    assert len(captured) == 1
+    assert "CLAIMING_PAID" in captured[0] and "UNRELATED" in captured[0]
+    assert "Download CLASS_A_CLAIMING_PAID.csv" in response.text
+    assert "Download CLASS_A_UNRELATED.csv" in response.text
+    assert "Download All (2026-03-01_r1.csv)" in response.text
+
+
+def test_status_preserves_separate_runs_for_different_disposition_sets():
+    site, *_ = make([record("r1")], llm=CountingLLM("a,b\n1,2\n"))
+    site.post("/run", params={"key": KEY}, content="prompt=rpc_ptp",
+              headers={"content-type": "application/x-www-form-urlencoded"})
+    site.post("/run", params={"key": KEY}, content="prompt=claiming_paid",
+              headers={"content-type": "application/x-www-form-urlencoded"})
+    text = site.get("/status", params={"key": KEY}).text
+    assert "RPC + PTP (1:1 Baseline)" in text
+    assert "Claiming Paid / Fully Paid" in text
+
+
 # -- configuration and entrypoint --------------------------------------------
 
 

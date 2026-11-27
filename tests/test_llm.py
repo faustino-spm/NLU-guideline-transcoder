@@ -202,6 +202,21 @@ def test_empty_prompt_file_fails_before_any_request(tmp_path):
     assert fake.requests == []
 
 
+def test_prompt_text_override_works_without_files_for_chained_call(tmp_path):
+    client, fake, _ = make(tmp_path, (200, reply(GOOD)), prompt="ignored")
+    result = client.generate_csv(date(2026, 3, 1), "Class A", [], prompt_text="  Stage 2 prompt  ")
+    assert result == GOOD
+    parts = fake.bodies[0]["messages"][1]["content"]
+    assert parts == [{"type": "text", "text": "Stage 2 prompt"}]
+
+
+def test_empty_prompt_text_override_fails_before_any_request(tmp_path):
+    client, fake, _ = make(tmp_path, prompt="valid")
+    with pytest.raises(LLMError, match="prompt is empty"):
+        client.generate_csv(None, "", [], prompt_text="   \n")
+    assert fake.requests == []
+
+
 # -- the reply ---------------------------------------------------------------
 
 

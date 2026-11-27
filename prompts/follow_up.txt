@@ -1,0 +1,12 @@
+### Disposition Block: Follow-Up / Broken Promise (`<SLUG>_PTP_FOLLOW_UP`)
+Generate **ONE** disposition: `<SLUG>_PTP_FOLLOW_UP` (Follow-Up call on an existing or broken Promise to Pay).
+
+**Consistent Deviations From RPC / PTP Baseline:**
+- **Preserve From Client Rubric:** Opening (greeting, agent/company name, recording disclosure `auto_fail`), Positive Identification / Account Verification (`auto_fail`), Soft Skills / Empathy / Active Listening (`active_listening_intent` `client` `negate`) / Call Quality (`voice intent must be less than 0.55` if present), Documentation (`auto_pass`), all Compliance / ZTP gates (`auto_fail` / `auto_fail,negate`), Closing, and the 3-row `Risk Level` block.
+- **Prune:** Remove or omit initial delinquency discovery rows that belong only to first-contact RPC/PTP (e.g., generic first-time account introduction, full 4-tier `priority1`–`priority4` negotiation hierarchy unless a broken-promise re-negotiation tier is explicitly required, and any 3PC-only rows).
+- **Inject / Swap In Broken-Promise & Re-PTP Checks** (placed under the client's main Call Proper / Negotiation / Collection Skills `Component`):
+  1. **Acknowledge Broken Promise / Prior PTP Status:** `ffup_broken_promise_acknowledgement_intent` (confirming whether the previously promised payment was made or acknowledging the broken promise).
+  2. **Probe Reason for Broken Promise (RBP):** `ffup_reason_for_broken_promise_intent` (probing why the previous promise to pay was not fulfilled).
+  3. **Secure New PTP Schedule:** `ffup_ask_new_ptp_sched_intent` (requesting a new commitment date/schedule to settle the overdue amount).
+  4. **Confirm & Recap New PTP Details:** `ptp_payment_amount_confirmation_intent`, `ptp_payment_date_confirmation_intent`, `ptp_payment_mode_of_payment_confirmation_intent`, and `summarize_amount_intent`, `summarize_date_intent`, `summarize_mode_of_payment_intent` (plus payment channel/posting if in the client rubric).
+- **Scoring:** Re-normalize active core `Component Score` values so unique active core `(Component, Checklist Name)` pairs on `<SLUG>_PTP_FOLLOW_UP` sum to **`100`** (rounded to 2 decimal places). Keep 0-pt ZTP/Compliance gates and `Risk Level` empty (`""`).

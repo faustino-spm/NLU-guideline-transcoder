@@ -1,0 +1,12 @@
+### Disposition Block: Claiming Paid / Fully Paid (`<SLUG>_CLAIMING_PAID`)
+Generate **ONE** disposition: `<SLUG>_CLAIMING_PAID` (Right Party Contact where the borrower states the account has already been paid or settled).
+
+**Consistent Deviations From RPC / PTP Baseline:**
+- **Preserve From Client Rubric:** Opening (greeting, agent/company name, recording disclosure `auto_fail`), Positive Identification / Account Verification (`auto_fail`), Soft Skills / Courtesy / Active Listening (`active_listening_intent` `client` `negate`) / Call Quality, Documentation (`auto_pass`), all Compliance / ZTP gates (`auto_fail` / `auto_fail,negate`), Closing, and the 3-row `Risk Level` block.
+- **Prune:** Remove all delinquency probing (`reason_for_delinquency_intent`, `source_of_income_intent`), payment urgency / consequences pressure, full `priority1`–`priority4` negotiation hierarchy, PTP capture (`ptp_payment_*`), PTP recap (`summarize_*`), and any 3PC-only rows.
+- **Inject / Swap In Settlement Verification Checks** (placed under the client's main Call Proper / Verification / Collection Skills `Component`):
+  1. **Date of Payment / Settlement Date:** `settlement_date_intent` (verifying the exact date the payment was made).
+  2. **Amount Paid:** `claiming_paid_amount_paid_intent` (verifying the exact amount paid by the borrower).
+  3. **Payment Channel / Mode of Payment:** `claiming_paid_payment_channel_intent` (verifying where/how the payment was made, e.g., bank branch, online banking, payment center).
+  4. **Reference Number / Proof of Payment:** `claiming_paid_reference_number_intent` (requesting the receipt/transaction reference number or guiding the customer to send proof of payment for verification and posting).
+- **Scoring:** Re-normalize active core `Component Score` values so unique active core `(Component, Checklist Name)` pairs on `<SLUG>_CLAIMING_PAID` sum to **`100`** (rounded to 2 decimal places). Keep 0-pt ZTP/Compliance gates and `Risk Level` empty (`""`).

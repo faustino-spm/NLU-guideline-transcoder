@@ -12,16 +12,13 @@ on a different instance.
 ## How it works
 
 1. A user ticks **Process Row?** on one or more rows in Lark.
-2. The user clicks the link in Lark. It opens a confirmation page listing the ticked rows (this page
-   changes nothing).
-3. Clicking **Run** processes the ticked rows inside that request, one at a time, and streams each
-   row to the page as it finishes:
-   - the row's attachments are downloaded from Lark and passed to the LLM
-   - the generated CSV (`<date>_<record_id>.csv`) appears directly on the page with a **Download**
-     link and an expandable **Preview** / **Copy CSV** button
+2. The user clicks the link in Lark. It opens a confirmation page listing the ticked rows and checkboxes for the disposition prompt blocks to generate (this page changes nothing). You can also pre-select prompts via deep links like `/run?key=<RUN_KEY>&prompt=rpc_ptp,claiming_paid` (or `&prompt=all`).
+3. Clicking **Run** processes the ticked rows inside that request, one at a time, and streams each row to the page as it finishes:
+   - the row's attachments are downloaded from Lark and passed to the LLM with the composed prompt blocks from `prompts/`
+   - selecting 1–3 blocks runs a single composed LLM call; selecting 4+ blocks including `rpc_ptp` automatically chains Call 2 (non-RPC dispositions) on top of Call 1's `RPC + PTP` CSV to prevent structural drift and output truncation
+   - the backend deterministically slices Phoenix AI 3 outputs by `Rule Name` so each disposition gets its own **Download** link + **Preview / Copy CSV**, alongside a **Download All** combined CSV link
 4. A run starts no new row once `RUN_BUDGET_SECONDS` (default 150) have passed.
-5. The **Status of all rows** page (`/status`) retains the output table of processed rows and their
-   CSV download links for the lifetime of the server instance.
+5. The **Status of all rows** page (`/status`) retains the output table of processed rows (per disposition selection) and their CSV download links for the lifetime of the server instance.
 
 ## The grid (read-only)
 
@@ -63,8 +60,11 @@ A `403 / 91403 Forbidden` error means step 2 is not finished (see Troubleshootin
 Without the link (command line, writes CSVs to `output/`):
 
 ```
-python pipeline.py --dry-run     # list what would be processed, change nothing
-python pipeline.py --run         # process the ticked rows and save CSVs to output/
+python pipeline.py --list-prompts                    # list available disposition prompt blocks
+python pipeline.py --dry-run                         # list what would be processed, change nothing
+python pipeline.py --run                             # process ticked rows with default rpc_ptp prompt
+python pipeline.py --run --prompt rpc_ptp,claiming_paid
+python pipeline.py --run --prompt all                # chained Call 1 (RPC+PTP) -> Call 2 (non-RPC)
 ```
 
 With the link:
