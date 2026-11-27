@@ -1,4 +1,4 @@
-"""NanoGPTLLM against a mocked NanoGPT API (no network)."""
+"""LLM clients (OpenAI-compatible / NanoGPT and Google Gemini) against mocked APIs (no network)."""
 
 from __future__ import annotations
 
@@ -12,7 +12,20 @@ import pytest
 
 import llm
 from lark_base import ConfigError
-from llm import LLMError, NANOGPT_MODEL, NANOGPT_URL, NanoGPTLLM, clean_csv, validate_csv
+from llm import (
+    GEMINI_MODEL,
+    GEMINI_URL,
+    GeminiLLM,
+    LLMError,
+    NANOGPT_MODEL,
+    NANOGPT_URL,
+    NanoGPTLLM,
+    OPENAI_MODEL,
+    OPENAI_URL,
+    OpenAICompatibleLLM,
+    clean_csv,
+    validate_csv,
+)
 
 GOOD = "name,score\nAnn,5\nBob,7\n"
 
@@ -323,13 +336,156 @@ def test_validate_csv_rejects(text, message):
         validate_csv(text)
 
 
+# -- generic OpenAI-compatible endpoint --------------------------------------
+
+
+def test_openai_compatible_endpoint_normalizes_base_url_and_omits_unset_reasoning_effort(tmp_path):
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("Parse it.", encoding="utf-8")
+    fake = FakeNanoGPT((200, reply(GOOD)))
+    client = OpenAICompatibleLLM(
+        "sk-test",
+        model="gpt-5-mini",
+        prompt_file=prompt_file,
+        url="https://openrouter.ai/api/v1/",
+        reasoning_effort=None,
+        transport=httpx.MockTransport(fake),
+    )
+
+    assert client.generate_csv(date(2026, 3, 1), "Class A", [pdf(tmp_path)]) == GOOD
+    assert str(fake.requests[0].url) == "https://openrouter.ai/api/v1/chat/completions"
+    assert fake.requests[0].headers["authorization"] == "Bearer sk-test"
+    assert fake.bodies[0]["model"] == "gpt-5-mini"
+    assert "reasoning_effort" not in fake.bodies[0]
+
+
+# -- Google Gemini native API ------------------------------------------------
+
+
+def gemini_reply(text: str, finish: str = "STOP", thought: str | None = None) -> dict:
+    parts: list[dict] = []
+    if thought is not None:
+        parts.append({"text": thought, "thought": True})
+    parts.append({"text": text})
+    return {"candidates": [{"content": {"parts": parts}, "finishReason": finish}]}
+
+
+def make_gemini(tmp_path, *responses, prompt="Parse it.", model=GEMINI_MODEL, **kwargs):
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text(prompt, encoding="utf-8")
+    fake = FakeNanoGPT(*responses)
+    sleeps: list[float] = []
+    client = GeminiLLM(
+        "gem-test-key",
+        model,
+        prompt_file,
+        transport=httpx.MockTransport(fake),
+        sleep=sleeps.append,
+        **kwargs,
+    )
+    return client, fake, sleeps
+
+
+def test_gemini_request_carries_key_header_model_files_and_prompt(tmp_path):
+    client, fake, _ = make_gemini(tmp_path, (200, gemini_reply(GOOD)), prompt="  Parse {sub_campaign} ({date}).  ")
+    txt = tmp_path / "0_note.txt"
+    txt.write_text("hello", encoding="utf-8")
+    files = [
+        txt,
+        make_xlsx(tmp_path, "1_a.xlsx"),
+        make_docx(tmp_path, "2_b.DOCX", header="QA v2", image_bytes=b"\x89PNGfake"),
+        pdf(tmp_path, "3_c.png", data=b"\x89PNGraw"),
+        pdf(tmp_path, "4_d.pdf", data=b"hello"),
+    ]
+
+    result = client.generate_csv(date(2026, 3, 1), "Class A", files)
+
+    assert result == GOOD
+    request = fake.requests[0]
+    assert str(request.url) == GEMINI_URL.format(model=GEMINI_MODEL)
+    assert request.headers["x-goog-api-key"] == "gem-test-key"
+    assert "gem-test-key" not in str(request.url)
+    body = fake.bodies[0]
+    assert body["generationConfig"] == {"thinkingConfig": {"thinkingLevel": "high"}}
+    assert "CSV only" in body["system_instruction"]["parts"][0]["text"]
+    parts = body["contents"][0]["parts"]
+    assert parts[0] == {"text": "Attachment (0_note.txt):\nhello"}
+    assert parts[1] == {
+        "text": "Attachment (1_a.xlsx):\n=== Sheet: Calibration ===\nAgent,Note,Date\nAnn,,2026-03-01",
+    }
+    assert parts[2] == {"text": "Attachment (2_b.DOCX):\n=== Header ===\nQA v2\n\nGuideline row"}
+    assert parts[3] == {
+        "inline_data": {"mime_type": "image/png", "data": base64.b64encode(b"\x89PNGfake").decode()},
+    }
+    assert parts[4] == {
+        "inline_data": {"mime_type": "image/png", "data": base64.b64encode(b"\x89PNGraw").decode()},
+    }
+    assert parts[5] == {
+        "inline_data": {"mime_type": "application/pdf", "data": base64.b64encode(b"hello").decode()},
+    }
+    assert parts[6] == {"text": "Parse Class A (2026-03-01)."}
+
+
+def test_gemini_prompt_text_override_and_thought_parts_ignored(tmp_path):
+    client, fake, _ = make_gemini(tmp_path, (200, gemini_reply(GOOD, thought="internal reasoning")))
+    result = client.generate_csv(date(2026, 3, 1), "Class A", [], prompt_text="  Stage 2 prompt  ")
+    assert result == GOOD
+    assert fake.bodies[0]["contents"][0]["parts"] == [{"text": "Stage 2 prompt"}]
+
+
+def test_gemini_errors_and_retries(tmp_path):
+    client, fake, sleeps = make_gemini(
+        tmp_path,
+        (429, {"error": {"message": "quota"}}),
+        (503, {}),
+        (200, gemini_reply(GOOD)),
+    )
+    assert client.generate_csv(None, "", [pdf(tmp_path)]) == GOOD
+    assert sleeps == [5.0, 20.0]
+    assert len(fake.requests) == 3
+
+    client_max, _, _ = make_gemini(tmp_path, (200, gemini_reply(GOOD, finish="MAX_TOKENS")))
+    with pytest.raises(LLMError, match="cut off"):
+        client_max.generate_csv(None, "", [pdf(tmp_path)])
+
+    client_blocked, _, _ = make_gemini(tmp_path, (200, {"candidates": [], "promptFeedback": {"blockReason": "SAFETY"}}))
+    with pytest.raises(LLMError, match="SAFETY"):
+        client_blocked.generate_csv(None, "", [pdf(tmp_path)])
+
+
+def test_gemini_network_failure_does_not_leak_key(tmp_path):
+    def boom(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    prompt_file = tmp_path / "prompt.txt"
+    prompt_file.write_text("p", encoding="utf-8")
+    client = GeminiLLM("gem-secret", prompt_file=prompt_file, transport=httpx.MockTransport(boom))
+    with pytest.raises(LLMError, match="could not reach Gemini: ConnectError") as info:
+        client.generate_csv(None, "", [pdf(tmp_path)])
+    assert "gem-secret" not in str(info.value)
+
+
 # -- choosing the LLM --------------------------------------------------------
 
 
 @pytest.fixture
 def env(monkeypatch):
     monkeypatch.setattr(llm, "load_dotenv", lambda *a, **k: None)
-    for name in ("LLM", "NANOGPT_API_KEY"):
+    monkeypatch.setattr(llm, "LLM_PROVIDER", "nanogpt")
+    for name in (
+        "LLM",
+        "NANOGPT_API_KEY",
+        "NANOGPT_MODEL",
+        "NANOGPT_URL",
+        "NANOGPT_REASONING_EFFORT",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_MODEL",
+        "OPENAI_REASONING_EFFORT",
+        "GEMINI_API_KEY",
+        "GEMINI_MODEL",
+        "GEMINI_THINKING_LEVEL",
+    ):
         monkeypatch.delenv(name, raising=False)
     return monkeypatch
 
@@ -339,7 +495,59 @@ def test_llm_from_env_defaults_to_nanogpt_with_hydrogen_high(env):
     chosen = llm.llm_from_env()
     assert isinstance(chosen, NanoGPTLLM)
     assert chosen.model == "google/gemini-4-hydrogen"
+    assert chosen.url == NANOGPT_URL
+    assert chosen.reasoning_effort == "high"
     assert chosen._http.headers["authorization"] == "Bearer key"
+
+
+def test_switching_backend_llm_provider_constant_selects_gemini(env):
+    env.setattr(llm, "LLM_PROVIDER", "gemini")
+    env.setenv("GEMINI_API_KEY", " gem-key ")
+    chosen = llm.llm_from_env()
+    assert isinstance(chosen, GeminiLLM)
+    assert chosen.model == GEMINI_MODEL
+    assert chosen._http.headers["x-goog-api-key"] == "gem-key"
+
+
+def test_switching_backend_llm_provider_constant_selects_openai(env):
+    env.setattr(llm, "LLM_PROVIDER", "openai")
+    env.setenv("OPENAI_API_KEY", " sk-key ")
+    env.setenv("OPENAI_BASE_URL", "https://api.example.com/v1")
+    env.setenv("OPENAI_MODEL", "gpt-5-mini")
+    env.setenv("OPENAI_REASONING_EFFORT", "medium")
+    chosen = llm.llm_from_env()
+    assert isinstance(chosen, OpenAICompatibleLLM)
+    assert not isinstance(chosen, NanoGPTLLM)
+    assert chosen.model == "gpt-5-mini"
+    assert chosen.url == "https://api.example.com/v1/chat/completions"
+    assert chosen.reasoning_effort == "medium"
+    assert chosen._http.headers["authorization"] == "Bearer sk-key"
+
+
+def test_llm_from_env_openai_defaults(env):
+    env.setenv("LLM", "openai")
+    env.setenv("OPENAI_API_KEY", "sk-key")
+    chosen = llm.llm_from_env()
+    assert isinstance(chosen, OpenAICompatibleLLM)
+    assert chosen.model == OPENAI_MODEL
+    assert chosen.url == OPENAI_URL
+    assert chosen.reasoning_effort is None
+
+
+def test_llm_from_env_gemini_supports_model_and_thinking_level_override(env):
+    env.setenv("LLM", "gemini")
+    env.setenv("GEMINI_API_KEY", "gem-key")
+    env.setenv("GEMINI_MODEL", "gemini-2.5-pro")
+    env.setenv("GEMINI_THINKING_LEVEL", "medium")
+    chosen = llm.llm_from_env()
+    assert isinstance(chosen, GeminiLLM)
+    assert chosen.model == "gemini-2.5-pro"
+    assert chosen.thinking_level == "medium"
+
+    env.setenv("GEMINI_THINKING_LEVEL", "")
+    chosen_none = llm.llm_from_env()
+    assert isinstance(chosen_none, GeminiLLM)
+    assert chosen_none.thinking_level is None
 
 
 def test_llm_from_env_stub_needs_no_key(env):
@@ -351,10 +559,18 @@ def test_llm_from_env_without_a_key_is_a_config_error_not_a_silent_stub(env):
     with pytest.raises(ConfigError, match="NANOGPT_API_KEY"):
         llm.llm_from_env()
 
+    env.setattr(llm, "LLM_PROVIDER", "gemini")
+    with pytest.raises(ConfigError, match="GEMINI_API_KEY"):
+        llm.llm_from_env()
+
+    env.setattr(llm, "LLM_PROVIDER", "openai")
+    with pytest.raises(ConfigError, match="OPENAI_API_KEY"):
+        llm.llm_from_env()
+
 
 def test_llm_from_env_rejects_an_unknown_choice(env):
-    env.setenv("LLM", "openai")
-    with pytest.raises(ConfigError, match="'nanogpt' or 'stub'"):
+    env.setenv("LLM", "anthropic")
+    with pytest.raises(ConfigError, match="'nanogpt', 'openai', 'gemini', 'stub'"):
         llm.llm_from_env()
 
 

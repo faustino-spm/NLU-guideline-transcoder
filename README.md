@@ -1,9 +1,13 @@
 # Lark Base row processor (prototype)
 
 Tick rows in a Lark Base grid, click a link in Lark, and the backend runs each ticked row through
-an LLM and streams downloadable CSVs directly in the browser. The LLM is NanoGPT
-(hardcoded to Hydrogen High: `google/gemini-4-hydrogen` with `reasoning_effort="high"`), prompted with `prompt.txt`. Set `LLM=stub` to use a stub instead
-(a fixed CSV describing its inputs), which tests the Lark wiring without calling NanoGPT.
+an LLM and streams downloadable CSVs directly in the browser. Supported providers are configured in
+`llm.py` via `LLM_PROVIDER`: `"nanogpt"` (default, OpenAI-compatible endpoint using
+`google/gemini-4-hydrogen` with `reasoning_effort="high"`), `"openai"` (any OpenAI-compatible
+`/chat/completions` endpoint), `"gemini"` (Google Gemini native `generateContent` API using
+`GEMINI_API_KEY`), and `"stub"` (a fixed CSV describing its inputs, for testing Lark wiring without
+calling an API). To switch providers, change `LLM_PROVIDER` in `llm.py` (or set the `LLM` env var)
+and redeploy.
 
 Lark Base access is read-only: nothing is written back to Lark and nothing is kept on disk or in
 memory between requests, so it runs on serverless hosts such as Vercel where each request may land
@@ -140,7 +144,7 @@ python -m pytest
 | `app.py` | Entrypoint: builds the app from the environment. Used by `uvicorn app:app` and by Vercel |
 | `web.py` | The link: confirmation page for ticked rows, streamed run with inline CSV downloads |
 | `pipeline.py` | Row model, `run_ticked_rows()` / `process_ticked_rows()`, and the command-line entry point |
-| `llm.py` | LLM interface, the stub, and the NanoGPT implementation (`NanoGPTLLM`, chosen by `llm_from_env()`) |
+| `llm.py` | LLM interface, provider switch (`LLM_PROVIDER`), stub, OpenAI-compatible client (`OpenAICompatibleLLM` / `NanoGPTLLM`), and Google Gemini client (`GeminiLLM`) |
 | `lark_base.py` | Read-only Base client (tenant token, list records/fields, attachment download), settings, `.env` loading, column names |
 | `vercel.json`, `.vercelignore`, `.python-version`, `requirements.txt` | Vercel deployment settings. `requirements-dev.txt` adds `uvicorn` and `pytest` for local work |
 | `lark-prototype-research.md` | Earlier design research (superseded by this README) |

@@ -1,7 +1,12 @@
-"""LLM interface, a stub for wiring checks, and the NanoGPT implementation.
+"""LLM interface, a stub for wiring checks, and OpenAI-compatible + Google Gemini implementations.
 
-`LLM=stub` in `.env` selects the stub; the default is NanoGPT (needs NANOGPT_API_KEY)
-with the model hardcoded to Hydrogen High (`google/gemini-4-hydrogen`, `reasoning_effort="high"`).
+Change `LLM_PROVIDER` below (and redeploy) to switch providers:
+- `"nanogpt"` — NanoGPT via OpenAI-compatible chat completions (uses `NANOGPT_API_KEY`)
+- `"openai"`  — OpenAI or any OpenAI-compatible endpoint (uses `OPENAI_API_KEY`, optional `OPENAI_BASE_URL` / `OPENAI_MODEL`)
+- `"gemini"`  — Google Gemini native `generateContent` API (uses `GEMINI_API_KEY`, optional `GEMINI_MODEL`)
+- `"stub"`    — Fixed dummy CSV without calling any API (for testing the Lark wiring)
+
+If the `LLM` environment variable is explicitly set (e.g. `LLM=stub`), it overrides `LLM_PROVIDER`.
 """
 
 from __future__ import annotations
@@ -26,10 +31,26 @@ from prompts import validate_prompts_exist
 
 log = logging.getLogger("llm")
 
+# -- Provider switch ---------------------------------------------------------
+# Change this value in the backend and redeploy to switch providers:
+#   "nanogpt" | "openai" | "gemini" | "stub"
+LLM_PROVIDER = "gemini"
+
 DEFAULT_PROMPT_FILE = Path(__file__).parent / "prompt.txt"
+
+# OpenAI-compatible endpoints
 NANOGPT_MODEL = "google/gemini-4-hydrogen"
 NANOGPT_REASONING_EFFORT = "high"
 NANOGPT_URL = "https://api.nano-gpt.com/api/v1/chat/completions"
+
+OPENAI_MODEL = "gpt-5"
+OPENAI_REASONING_EFFORT: str | None = None
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+
+# Google Gemini native API
+GEMINI_MODEL = "gemini-4-hydrogen"
+GEMINI_THINKING_LEVEL: str | None = "high"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 # What every request is told, whatever prompt.txt says, so the reply can be saved as a file as is.
 SYSTEM_INSTRUCTION = "Reply with the CSV only: a header row, then one record per line. No commentary, no code fences."
@@ -95,7 +116,7 @@ class StubLLM:
         return buffer.getvalue()
 
 
-# -- NanoGPT -----------------------------------------------------------------
+# -- Shared helpers ----------------------------------------------------------
 
 
 class LLMError(RuntimeError):
@@ -132,9 +153,9 @@ def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def _extract_embedded_images(zf: zipfile.ZipFile, prefix: str) -> list[dict]:
-    """Return image_url content parts for supported raster images stored under `prefix` in a ZIP archive."""
-    parts: list[dict] = []
+def _extract_embedded_images(zf: zipfile.ZipFile, prefix: str) -> list[tuple[str, str]]:
+    """Return `(mime, base64_data)` tuples for supported raster images under `prefix` in a ZIP archive."""
+    images: list[tuple[str, str]] = []
     for name in sorted(zf.namelist()):
         if not name.startswith(prefix) or name.endswith("/"):
             continue
@@ -143,8 +164,8 @@ def _extract_embedded_images(zf: zipfile.ZipFile, prefix: str) -> list[dict]:
             continue
         mime = MIME_BY_SUFFIX[suffix]
         encoded = base64.b64encode(zf.read(name)).decode("ascii")
-        parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}})
-    return parts
+        images.append((mime, encoded))
+    return images
 
 
 def _docx_paragraph_text(p: ET.Element) -> str:
@@ -185,7 +206,7 @@ def _docx_xml_lines(xml_bytes: bytes) -> list[str]:
     return lines
 
 
-def _extract_docx(zf: zipfile.ZipFile) -> tuple[str, list[dict]]:
+def _extract_docx(zf: zipfile.ZipFile) -> tuple[str, list[tuple[str, str]]]:
     names = zf.namelist()
     sections: list[str] = []
     headers = sorted(n for n in names if re.fullmatch(r"word/header\d*\.xml", n))
@@ -298,7 +319,7 @@ def _xlsx_sheet_entries(zf: zipfile.ZipFile) -> list[tuple[str, str]]:
     ]
 
 
-def _extract_xlsx(zf: zipfile.ZipFile) -> tuple[str, list[dict]]:
+def _extract_xlsx(zf: zipfile.ZipFile) -> tuple[str, list[tuple[str, str]]]:
     names = set(zf.namelist())
     shared: list[str] = []
     if "xl/sharedStrings.xml" in names:
@@ -358,7 +379,7 @@ def _extract_xlsx(zf: zipfile.ZipFile) -> tuple[str, list[dict]]:
     return "\n\n".join(sections), _extract_embedded_images(zf, "xl/media/")
 
 
-def _extract_pptx(zf: zipfile.ZipFile) -> tuple[str, list[dict]]:
+def _extract_pptx(zf: zipfile.ZipFile) -> tuple[str, list[tuple[str, str]]]:
     slide_files = sorted(
         (n for n in zf.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
         key=lambda n: int(re.search(r"(\d+)\.xml$", n).group(1)),
@@ -377,7 +398,7 @@ def _extract_pptx(zf: zipfile.ZipFile) -> tuple[str, list[dict]]:
     return "\n\n".join(sections), _extract_embedded_images(zf, "ppt/media/")
 
 
-def _extract_odf(zf: zipfile.ZipFile) -> tuple[str, list[dict]]:
+def _extract_odf(zf: zipfile.ZipFile) -> tuple[str, list[tuple[str, str]]]:
     root = ET.fromstring(zf.read("content.xml"))
     lines = [
         "".join(el.itertext()).strip()
@@ -387,63 +408,81 @@ def _extract_odf(zf: zipfile.ZipFile) -> tuple[str, list[dict]]:
     return "\n".join(line for line in lines if line), _extract_embedded_images(zf, "Pictures/")
 
 
-def _extract_office_parts(path: Path) -> list[dict]:
-    """Extract text and embedded images from ZIP-based Office/OpenDocument files."""
+def _extract_office_content(path: Path) -> tuple[str, list[tuple[str, str]]]:
+    """Extract text and `(mime, base64_data)` embedded images from ZIP-based Office/OpenDocument files."""
     suffix = path.suffix.lower()
     try:
         with zipfile.ZipFile(path) as zf:
             if suffix == ".docx":
-                text, images = _extract_docx(zf)
-            elif suffix == ".xlsx":
-                text, images = _extract_xlsx(zf)
-            elif suffix == ".pptx":
-                text, images = _extract_pptx(zf)
-            else:
-                text, images = _extract_odf(zf)
+                return _extract_docx(zf)
+            if suffix == ".xlsx":
+                return _extract_xlsx(zf)
+            if suffix == ".pptx":
+                return _extract_pptx(zf)
+            return _extract_odf(zf)
     except (zipfile.BadZipFile, ET.ParseError, KeyError, OSError) as exc:
         raise LLMError(f"could not read {path.name}: {type(exc).__name__}") from exc
-    parts: list[dict] = [{"type": "text", "text": f"Attachment ({path.name}):\n{text}"}]
-    parts.extend(images)
-    return parts
 
 
-def _attachment_parts(path: Path) -> list[dict]:
-    """Encode one attachment as one or more OpenAI-compatible chat content parts."""
-    suffix = path.suffix.lower()
-    mime = MIME_BY_SUFFIX.get(suffix)
-    if mime is None:
-        raise LLMError(f"unsupported attachment type: {path.name}")
-    if suffix in TEXT_SUFFIXES:
-        text = path.read_text(encoding="utf-8-sig", errors="replace")
-        return [{"type": "text", "text": f"Attachment ({path.name}):\n{text}"}]
-    if suffix in OFFICE_SUFFIXES:
-        return _extract_office_parts(path)
-    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-    data_url = f"data:{mime};base64,{encoded}"
-    if suffix in IMAGE_SUFFIXES:
-        return [{"type": "image_url", "image_url": {"url": data_url}}]
-    return [{"type": "file", "file": {"filename": path.name, "file_data": data_url}}]
+def _resolve_prompt(
+    prompt_file: Path,
+    row_date: date | None,
+    sub_campaign: str,
+    prompt_text: str | None = None,
+) -> str:
+    if prompt_text is not None:
+        prompt = prompt_text.strip()
+        if not prompt:
+            raise LLMError("prompt is empty")
+        return prompt
+    prompt = prompt_file.read_text(encoding="utf-8-sig").strip()
+    if not prompt:
+        raise LLMError(f"{prompt_file.name} is empty")
+    # The row's values reach the model only where the prompt asks for them.
+    return (
+        prompt.replace("{date}", row_date.isoformat() if row_date else "unknown")
+        .replace("{sub_campaign}", sub_campaign or "unknown")
+    )
 
 
-class NanoGPTLLM:
-    """Sends the row's files and prompt.txt to NanoGPT (Hydrogen High) and returns the CSV it writes.
+def _api_error(response: httpx.Response) -> str:
+    try:
+        err = response.json()["error"]
+        if isinstance(err, dict):
+            return str(err["message"])[:300]
+        return str(err)[:300]
+    except (ValueError, KeyError, TypeError):
+        return response.text[:300]
 
-    The prompt file is read on every call, so editing it needs no restart; `{date}` and `{sub_campaign}`
-    in it are replaced by the row's values. A reply that is not a valid CSV is asked for once more,
-    then the row fails. Rate limits and server errors (429, 5xx) are retried with a pause.
-    """
 
-    def __init__(self, api_key: str, model: str = NANOGPT_MODEL,
-                 prompt_file: Path = DEFAULT_PROMPT_FILE, timeout: float = 300.0,
-                 transport: httpx.BaseTransport | None = None,
-                 sleep: Callable[[float], None] = time.sleep,
-                 retry_delays: tuple[float, ...] = (5.0, 20.0)):
+def _chat_completions_url(url: str) -> str:
+    cleaned = url.strip().rstrip("/")
+    if cleaned.endswith("/chat/completions"):
+        return cleaned
+    return f"{cleaned}/chat/completions"
+
+
+class _BaseHTTPLLM:
+    """Shared prompt validation, CSV retry (2 attempts), and HTTP retry (429/5xx) loop."""
+
+    provider_name: str = "LLM"
+
+    def __init__(
+        self,
+        model: str,
+        prompt_file: Path = DEFAULT_PROMPT_FILE,
+        *,
+        timeout: float = 300.0,
+        transport: httpx.BaseTransport | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        retry_delays: tuple[float, ...] = (5.0, 20.0),
+        headers: dict[str, str] | None = None,
+    ):
         self.model = model
         self.prompt_file = prompt_file
         self._sleep = sleep
         self._retry_delays = retry_delays
-        self._http = httpx.Client(timeout=timeout, transport=transport,
-                                  headers={"Authorization": f"Bearer {api_key}"})
+        self._http = httpx.Client(timeout=timeout, transport=transport, headers=headers)
 
     def generate_csv(
         self,
@@ -474,62 +513,63 @@ class NanoGPTLLM:
         *,
         prompt_text: str | None = None,
     ) -> dict:
-        if prompt_text is not None:
-            prompt = prompt_text.strip()
-            if not prompt:
-                raise LLMError("prompt is empty")
-        else:
-            prompt = self.prompt_file.read_text(encoding="utf-8-sig").strip()
-            if not prompt:
-                raise LLMError(f"{self.prompt_file.name} is empty")
-            # The row's values reach the model only where the prompt asks for them.
-            prompt = (prompt.replace("{date}", row_date.isoformat() if row_date else "unknown")
-                      .replace("{sub_campaign}", sub_campaign or "unknown"))
-        parts: list[dict] = []
-        for path in files:
-            parts.extend(_attachment_parts(path))
-        parts.append({"type": "text", "text": prompt})
-        return {
-            "model": self.model,
-            "reasoning_effort": NANOGPT_REASONING_EFFORT,
-            "messages": [
-                {"role": "system", "content": SYSTEM_INSTRUCTION},
-                {"role": "user", "content": parts},
-            ],
-        }
+        raise NotImplementedError
 
     def _call(self, body: dict) -> str:
-        """POST one chat completions request and return the reply text."""
+        raise NotImplementedError
+
+    def _post_json(self, url: str, body: dict) -> dict:
+        """POST JSON with retries on rate limits / 5xx and return the parsed JSON body."""
         for attempt in range(len(self._retry_delays) + 1):
             try:
-                response = self._http.post(NANOGPT_URL, json=body)
+                response = self._http.post(url, json=body)
             except httpx.HTTPError as exc:
-                raise LLMError(f"could not reach NanoGPT: {type(exc).__name__}") from exc
+                raise LLMError(f"could not reach {self.provider_name}: {type(exc).__name__}") from exc
             if response.status_code in RETRY_STATUSES and attempt < len(self._retry_delays):
                 delay = self._retry_delays[attempt]
-                log.warning("NanoGPT returned %s, retrying in %.0fs", response.status_code, delay)
+                log.warning("%s returned %s, retrying in %.0fs", self.provider_name, response.status_code, delay)
                 self._sleep(delay)
                 continue
             break
         if response.status_code != 200:
-            raise LLMError(f"NanoGPT returned {response.status_code}: {_api_error(response)}")
-        return _reply_text(response.json())
+            raise LLMError(f"{self.provider_name} returned {response.status_code}: {_api_error(response)}")
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise LLMError(f"{self.provider_name} returned invalid JSON") from exc
 
 
-def _api_error(response: httpx.Response) -> str:
-    try:
-        err = response.json()["error"]
-        if isinstance(err, dict):
-            return str(err["message"])[:300]
-        return str(err)[:300]
-    except (ValueError, KeyError, TypeError):
-        return response.text[:300]
+# -- OpenAI-compatible endpoints (NanoGPT, OpenAI, OpenRouter, etc.) ---------
 
 
-def _reply_text(data: dict) -> str:
+def _openai_attachment_parts(path: Path) -> list[dict]:
+    """Encode one attachment as one or more OpenAI-compatible chat content parts."""
+    suffix = path.suffix.lower()
+    mime = MIME_BY_SUFFIX.get(suffix)
+    if mime is None:
+        raise LLMError(f"unsupported attachment type: {path.name}")
+    if suffix in TEXT_SUFFIXES:
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+        return [{"type": "text", "text": f"Attachment ({path.name}):\n{text}"}]
+    if suffix in OFFICE_SUFFIXES:
+        text, images = _extract_office_content(path)
+        parts: list[dict] = [{"type": "text", "text": f"Attachment ({path.name}):\n{text}"}]
+        parts.extend(
+            {"type": "image_url", "image_url": {"url": f"data:{img_mime};base64,{img_b64}"}}
+            for img_mime, img_b64 in images
+        )
+        return parts
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    data_url = f"data:{mime};base64,{encoded}"
+    if suffix in IMAGE_SUFFIXES:
+        return [{"type": "image_url", "image_url": {"url": data_url}}]
+    return [{"type": "file", "file": {"filename": path.name, "file_data": data_url}}]
+
+
+def _openai_reply_text(data: dict, provider_name: str = "OpenAI") -> str:
     choices = data.get("choices") or []
     if not choices:
-        raise LLMError("NanoGPT returned no answer (no choices)")
+        raise LLMError(f"{provider_name} returned no answer (no choices)")
     choice = choices[0]
     finish = choice.get("finish_reason") or ""
     if finish == "length":
@@ -545,22 +585,291 @@ def _reply_text(data: dict) -> str:
     else:
         text = content or ""
     if not text.strip() and finish not in ("", "stop"):
-        raise LLMError(f"NanoGPT stopped without an answer ({finish})")
+        raise LLMError(f"{provider_name} stopped without an answer ({finish})")
     return text
 
 
+class OpenAICompatibleLLM(_BaseHTTPLLM):
+    """Sends attachments and prompt to any OpenAI-compatible `/chat/completions` endpoint."""
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = OPENAI_MODEL,
+        prompt_file: Path = DEFAULT_PROMPT_FILE,
+        *,
+        url: str = OPENAI_URL,
+        reasoning_effort: str | None = OPENAI_REASONING_EFFORT,
+        provider_name: str = "OpenAI",
+        timeout: float = 300.0,
+        transport: httpx.BaseTransport | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        retry_delays: tuple[float, ...] = (5.0, 20.0),
+    ):
+        self.url = _chat_completions_url(url)
+        self.reasoning_effort = reasoning_effort
+        self.provider_name = provider_name
+        super().__init__(
+            model=model,
+            prompt_file=prompt_file,
+            timeout=timeout,
+            transport=transport,
+            sleep=sleep,
+            retry_delays=retry_delays,
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+
+    def _request_body(
+        self,
+        row_date: date | None,
+        sub_campaign: str,
+        files: list[Path],
+        *,
+        prompt_text: str | None = None,
+    ) -> dict:
+        prompt = _resolve_prompt(self.prompt_file, row_date, sub_campaign, prompt_text=prompt_text)
+        parts: list[dict] = []
+        for path in files:
+            parts.extend(_openai_attachment_parts(path))
+        parts.append({"type": "text", "text": prompt})
+        body: dict = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": SYSTEM_INSTRUCTION},
+                {"role": "user", "content": parts},
+            ],
+        }
+        if self.reasoning_effort:
+            body["reasoning_effort"] = self.reasoning_effort
+        return body
+
+    def _call(self, body: dict) -> str:
+        return _openai_reply_text(self._post_json(self.url, body), self.provider_name)
+
+
+class NanoGPTLLM(OpenAICompatibleLLM):
+    """NanoGPT client (OpenAI-compatible endpoint, defaulting to Hydrogen High)."""
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = NANOGPT_MODEL,
+        prompt_file: Path = DEFAULT_PROMPT_FILE,
+        *,
+        url: str = NANOGPT_URL,
+        reasoning_effort: str | None = NANOGPT_REASONING_EFFORT,
+        timeout: float = 300.0,
+        transport: httpx.BaseTransport | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        retry_delays: tuple[float, ...] = (5.0, 20.0),
+    ):
+        super().__init__(
+            api_key=api_key,
+            model=model,
+            prompt_file=prompt_file,
+            url=url,
+            reasoning_effort=reasoning_effort,
+            provider_name="NanoGPT",
+            timeout=timeout,
+            transport=transport,
+            sleep=sleep,
+            retry_delays=retry_delays,
+        )
+
+
+# -- Google Gemini native API ------------------------------------------------
+
+
+def _gemini_attachment_parts(path: Path) -> list[dict]:
+    """Encode one attachment as one or more Google Gemini `generateContent` parts."""
+    suffix = path.suffix.lower()
+    mime = MIME_BY_SUFFIX.get(suffix)
+    if mime is None:
+        raise LLMError(f"unsupported attachment type: {path.name}")
+    if suffix in TEXT_SUFFIXES:
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+        return [{"text": f"Attachment ({path.name}):\n{text}"}]
+    if suffix in OFFICE_SUFFIXES:
+        text, images = _extract_office_content(path)
+        parts: list[dict] = [{"text": f"Attachment ({path.name}):\n{text}"}]
+        parts.extend(
+            {"inline_data": {"mime_type": img_mime, "data": img_b64}}
+            for img_mime, img_b64 in images
+        )
+        return parts
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return [{"inline_data": {"mime_type": mime, "data": encoded}}]
+
+
+def _gemini_reply_text(data: dict) -> str:
+    candidates = data.get("candidates") or []
+    if not candidates:
+        reason = (data.get("promptFeedback") or {}).get("blockReason", "no candidates")
+        raise LLMError(f"Gemini returned no answer ({reason})")
+    candidate = candidates[0]
+    finish = candidate.get("finishReason", "")
+    if finish == "MAX_TOKENS":
+        raise LLMError("the answer was cut off at the model's output limit, so the CSV is incomplete")
+    parts = (candidate.get("content") or {}).get("parts") or []
+    text = "".join(part.get("text", "") for part in parts if not part.get("thought"))
+    if not text.strip() and finish not in ("", "STOP"):
+        raise LLMError(f"Gemini stopped without an answer ({finish})")
+    return text
+
+
+class GeminiLLM(_BaseHTTPLLM):
+    """Sends attachments and prompt to the Google Gemini native `generateContent` API."""
+
+    provider_name = "Gemini"
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = GEMINI_MODEL,
+        prompt_file: Path = DEFAULT_PROMPT_FILE,
+        *,
+        thinking_level: str | None = GEMINI_THINKING_LEVEL,
+        url_template: str = GEMINI_URL,
+        timeout: float = 300.0,
+        transport: httpx.BaseTransport | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        retry_delays: tuple[float, ...] = (5.0, 20.0),
+    ):
+        self.thinking_level = thinking_level
+        self.url_template = url_template
+        super().__init__(
+            model=model,
+            prompt_file=prompt_file,
+            timeout=timeout,
+            transport=transport,
+            sleep=sleep,
+            retry_delays=retry_delays,
+            headers={"x-goog-api-key": api_key},
+        )
+
+    def _request_body(
+        self,
+        row_date: date | None,
+        sub_campaign: str,
+        files: list[Path],
+        *,
+        prompt_text: str | None = None,
+    ) -> dict:
+        prompt = _resolve_prompt(self.prompt_file, row_date, sub_campaign, prompt_text=prompt_text)
+        parts: list[dict] = []
+        for path in files:
+            parts.extend(_gemini_attachment_parts(path))
+        parts.append({"text": prompt})
+        body: dict = {
+            "system_instruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
+            "contents": [{"role": "user", "parts": parts}],
+        }
+        if self.thinking_level:
+            body["generationConfig"] = {
+                "thinkingConfig": {"thinkingLevel": self.thinking_level},
+            }
+        return body
+
+    def _call(self, body: dict) -> str:
+        url = self.url_template.format(model=self.model)
+        return _gemini_reply_text(self._post_json(url, body))
+
+
+# -- Provider builders -------------------------------------------------------
+
+
+def _openai_config_from_env(
+    *,
+    api_key_env: str,
+    model_env: str,
+    url_env: str,
+    reasoning_effort_env: str,
+    default_model: str,
+    default_url: str,
+    default_reasoning_effort: str | None,
+    provider_name: str,
+) -> tuple[str, str, str, str | None]:
+    api_key = os.environ.get(api_key_env, "").strip()
+    if not api_key:
+        raise ConfigError(f"{api_key_env} is not set (set LLM=stub to run without {provider_name})")
+    model = os.environ.get(model_env, "").strip() or default_model
+    url = os.environ.get(url_env, "").strip() or default_url
+    raw_effort = os.environ.get(reasoning_effort_env)
+    reasoning_effort = (
+        (raw_effort.strip() or None) if raw_effort is not None else default_reasoning_effort
+    )
+    return api_key, model, url, reasoning_effort
+
+
+def openai_llm_from_env() -> OpenAICompatibleLLM:
+    """Build a generic OpenAI-compatible chat completions client from environment variables."""
+    api_key, model, url, reasoning_effort = _openai_config_from_env(
+        api_key_env="OPENAI_API_KEY",
+        model_env="OPENAI_MODEL",
+        url_env="OPENAI_BASE_URL",
+        reasoning_effort_env="OPENAI_REASONING_EFFORT",
+        default_model=OPENAI_MODEL,
+        default_url=OPENAI_URL,
+        default_reasoning_effort=OPENAI_REASONING_EFFORT,
+        provider_name="OpenAI",
+    )
+    return OpenAICompatibleLLM(
+        api_key,
+        model=model,
+        url=url,
+        reasoning_effort=reasoning_effort,
+        provider_name="OpenAI",
+    )
+
+
+def nanogpt_llm_from_env() -> NanoGPTLLM:
+    """Build the NanoGPT client (OpenAI-compatible endpoint) from environment variables."""
+    api_key, model, url, reasoning_effort = _openai_config_from_env(
+        api_key_env="NANOGPT_API_KEY",
+        model_env="NANOGPT_MODEL",
+        url_env="NANOGPT_URL",
+        reasoning_effort_env="NANOGPT_REASONING_EFFORT",
+        default_model=NANOGPT_MODEL,
+        default_url=NANOGPT_URL,
+        default_reasoning_effort=NANOGPT_REASONING_EFFORT,
+        provider_name="NanoGPT",
+    )
+    return NanoGPTLLM(api_key, model=model, url=url, reasoning_effort=reasoning_effort)
+
+
+def gemini_llm_from_env() -> GeminiLLM:
+    """Build the Google Gemini native API client from environment variables."""
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise ConfigError("GEMINI_API_KEY is not set (set LLM=stub to run without Gemini)")
+    model = os.environ.get("GEMINI_MODEL", "").strip() or GEMINI_MODEL
+    raw_level = os.environ.get("GEMINI_THINKING_LEVEL")
+    thinking_level = (
+        (raw_level.strip() or None) if raw_level is not None else GEMINI_THINKING_LEVEL
+    )
+    return GeminiLLM(api_key, model=model, thinking_level=thinking_level)
+
+
 def llm_from_env() -> LLM:
-    """NanoGPT (Hydrogen High) by default; `LLM=stub` in the environment selects the stub."""
+    """Build the configured LLM provider.
+
+    Uses `LLM` from the environment if set, otherwise `LLM_PROVIDER` at the top of this file.
+    """
     load_dotenv()
-    choice = os.environ.get("LLM", "nanogpt").strip().lower()
+    choice = os.environ.get("LLM", LLM_PROVIDER).strip().lower() or LLM_PROVIDER.strip().lower()
     if choice == "stub":
         return StubLLM()
-    if choice != "nanogpt":
-        raise ConfigError(f"LLM must be 'nanogpt' or 'stub', got {choice!r}")
-    api_key = os.environ.get("NANOGPT_API_KEY", "").strip()
-    if not api_key:
-        raise ConfigError("NANOGPT_API_KEY is not set (set LLM=stub to run without NanoGPT)")
+    builders: dict[str, Callable[[], LLM]] = {
+        "nanogpt": nanogpt_llm_from_env,
+        "openai": openai_llm_from_env,
+        "gemini": gemini_llm_from_env,
+    }
+    builder = builders.get(choice)
+    if builder is None:
+        valid = ", ".join(repr(name) for name in (*builders, "stub"))
+        raise ConfigError(f"LLM must be one of {valid}, got {choice!r}")
+    client = builder()
     if not DEFAULT_PROMPT_FILE.is_file():
         raise ConfigError(f"{DEFAULT_PROMPT_FILE.name} is missing")
     validate_prompts_exist()
-    return NanoGPTLLM(api_key, NANOGPT_MODEL)
+    return client
